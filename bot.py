@@ -49,7 +49,7 @@ class MoveItAPI:
             return None
         try:
             r = self.session.get(f"{MOVEIT_BASE_URL}/{path.lstrip('/')}", params=params, timeout=10)
-            print(f"MoveIT API {path} -> {r.status_code}: {r.text[:4000]}")
+            print(f"MoveIT API {path} -> {r.status_code}: {r.text[:300]}")
             if r.status_code == 200:
                 return r.json()
         except Exception as e:
@@ -100,32 +100,70 @@ def _as_text(value):
     return str(value)
 
 
-def _stop_action(stop):
-    return ((stop.get("stopaction") or {}).get("code") or "").strip().lower()
+def _stop_action_text(stop):
+    return _norm(_as_text(_find_key(stop, "stopaction", "action")) or "")
 
 
-def _stop_place(stop):
-    addr = stop.get("address") or {}
-    name = addr.get("name") or addr.get("code") or ""
-    town = addr.get("town") or ""
-    if town and town.lower() != name.lower():
-        return f"{name}, {town}"
-    return name
+def _stop_trailer_ref(stop):
+    """A stop may carry its trailer reference under several possible keys."""
+    t = _find_key(stop, "trailer", "starttrailer", "finishtrailer", "trailercode")
+    if t is None:
+        return None
+    if isinstance(t, dict):
+        return str(_find_key(t, "code", "registration") or ""), _find_key(t, "id")
+    return str(t), None
 
 
 def extract_job_summary(job):
-    """Pull collection/delivery details out of a job's stops.
-    Move IT's job model has no top-level address fields - it's all in stops[]."""
-    stops = job.get("stops") or []
-    collection = next((s for s in stops if "collection" in _stop_action(s)), None)
-    delivery = next((s for s in stops if _stop_action(s) in ("drop trailer", "delivery")), None)
+    """Pull the useful fields out of a job record by walking its stops."""
+    stops = _find_key(job, "stops") or []
+    stops = sorted(stops, key=lambda s: _find_key(s, "stopdatetime") or "")
+
+    collection_stop = next((s for s in stops if "collect" in _stop_action_text(s)), None)
+    # "Drop Trailer" / "Deliver" style actions mark the delivery stop -
+    # exclude any "collect" match so we don't double count.
+    delivery_stop = next(
+        (s for s in stops if ("drop" in _stop_action_text(s) or "deliver" in _stop_action_text(s))
+         and "collect" not in _stop_action_text(s)),
+        None,
+    )
+
     return {
-        "job_id": job.get("id"),
-        "customer": _as_text(job.get("customer")),
-        "collection": _stop_place(collection) if collection else None,
-        "collection_country": (collection.get("address") or {}).get("country") if collection else None,
-        "delivery": _stop_place(delivery) if delivery else None,
+        "job_id": _find_key(job, "id", "jobid", "job #", "job_no", "jobnumber"),
+        "customer": _as_text(_find_key(job, "customer", "customer name", "client")),
+        "collection": _as_text(_find_key(collection_stop, "address")) if collection_stop else None,
+        "delivery": _as_text(_find_key(delivery_stop, "address")) if delivery_stop else None,
+        "collection_time": _find_key(collection_stop, "stopdatetime") if collection_stop else None,
+        "delivery_time": _find_key(delivery_stop, "stopdatetime") if delivery_stop else None,
+        "from_c": _as_text(_find_key(job, "from", "fromcountry", "origin")),
+        "to_c": _as_text(_find_key(job, "to", "tocountry", "destination")),
+        "ferry": _as_text(_find_key(job, "ferrybooking", "ferry", "crossing")),
     }
+
+
+def job_matches_trailer(job, trailer_code, trailer_id):
+    """Does this job reference our trailer? Checks the job itself, then walks its stops."""
+    trailer_code = (trailer_code or "").upper()
+
+    def _matches(code, tid):
+        return (code or "").upper() == trailer_code or (trailer_id is not None and tid == trailer_id)
+
+    # Some job payloads may still carry the trailer at top level - keep this as a fallback.
+    t = _find_key(job, "trailer", "starttrailer", "finishtrailer", "trailercode")
+    if t is not None:
+        if isinstance(t, dict):
+            if _matches(_find_key(t, "code", "registration"), _find_key(t, "id")):
+                return True
+        elif trailer_code in str(t).upper():
+            return True
+
+    # Per the live API, the trailer reference actually lives inside each stop.
+    for stop in _find_key(job, "stops") or []:
+        code, tid = _stop_trailer_ref(stop) or (None, None)
+        if code is not None and _matches(code, tid):
+            return True
+
+    return False
 
 
 QUICK_POINTS = {
@@ -146,29 +184,19 @@ def load_address_book():
     if not os.path.exists(path):
         print("No locations.csv found - running with quick buttons only")
         return
-    rows = None
-    for encoding in ("utf-8-sig", "cp1252"):
-        try:
-            with open(path, newline="", encoding=encoding) as f:
-                rows = list(csv.DictReader(f))
-            break
-        except UnicodeDecodeError:
-            continue
-        except Exception as e:
-            print(f"Could not load locations.csv: {e}")
-            return
-    if rows is None:
-        print("Could not load locations.csv: unreadable text encoding")
-        return
-    for row in rows:
-        name = (row.get("Name") or "").strip()
-        if name:
-            ADDRESS_BOOK.append({
-                "name": name,
-                "city": (row.get("City") or "").strip(),
-                "country": (row.get("Country") or "").strip(),
-            })
-    print(f"Loaded {len(ADDRESS_BOOK)} locations from locations.csv")
+    try:
+        with open(path, newline="", encoding="utf-8-sig") as f:
+            for row in csv.DictReader(f):
+                name = (row.get("Name") or "").strip()
+                if name:
+                    ADDRESS_BOOK.append({
+                        "name": name,
+                        "city": (row.get("City") or "").strip(),
+                        "country": (row.get("Country") or "").strip(),
+                    })
+        print(f"Loaded {len(ADDRESS_BOOK)} locations from locations.csv")
+    except Exception as e:
+        print(f"Could not load locations.csv: {e}")
 
 
 def search_locations(query, limit=8):
@@ -274,7 +302,7 @@ def customs_needed(country, port):
     c = (country or "").lower().strip()
     if c == "northern ireland" and port in NI_PORTS:
         return False
-    if port in DIRECT_EU_PORTS and c in EU_COUNTRIES:
+    if port in DIRECT_EU_PORTS and c in EU_COUNTRIES and c != "ireland":
         return False
     return True
 
@@ -332,6 +360,8 @@ def post_to_teams(data):
             facts.insert(2, {"title": "Customer", "value": job["customer"]})
         if job.get("delivery"):
             facts.append({"title": "Delivery", "value": job["delivery"]})
+        if job.get("ferry"):
+            facts.append({"title": "Ferry booking", "value": job["ferry"]})
     if data.get("live_text"):
         facts.append({"title": "Trailer last seen", "value": data["live_text"]})
 
@@ -394,27 +424,27 @@ async def get_trailer(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 when = _find_key(loc, "recordedon")
                 context.user_data["live_text"] = f"{text or ''} {('(' + str(when)[:16] + ')') if when else ''}".strip()
 
-        # Move IT's job data has no trailer reference at all, so we can't auto-match
-        # a job to this trailer. Instead, let the driver pick their own from today's
-        # collection jobs - saves typing without guessing at a link that doesn't exist.
-        options = {}
-        for job in API.todays_jobs():
-            if len(options) >= 10:
-                break
-            s = extract_job_summary(job)
-            if s.get("collection"):
-                label = f"{s['customer'] or 'Unknown'} - {s['collection']}"[:60]
-                options[label] = s
-        if options:
-            context.user_data["job_options"] = options
-            await update.message.reply_text(
-                f"Trailer *{trailer_code}* noted.\n\n"
-                "*Today's collection jobs in Move IT* - tap yours:",
-                parse_mode="Markdown",
-                reply_markup=build_keyboard(list(options.keys()), cols=1,
-                                             extra_row=["None of these - enter details myself"]),
-            )
-            return JOB_CONFIRM
+            trailer_id = _find_key(trailer, "id")
+            for job in API.todays_jobs():
+                if job_matches_trailer(job, trailer_code, trailer_id):
+                    s = extract_job_summary(job)
+                    context.user_data["job_summary"] = s
+                    if s.get("collection"):
+                        context.user_data["collection"] = s["collection"]
+                    lines = [f"*Found your job in Move IT:*\n"]
+                    if s.get("customer"):
+                        lines.append(f"Customer: {s['customer']}")
+                    if s.get("collection"):
+                        lines.append(f"Collection: {s['collection']}")
+                    if s.get("delivery"):
+                        lines.append(f"Delivery: {s['delivery']}")
+                    lines.append("\nIs this your load?")
+                    await update.message.reply_text(
+                        "\n".join(lines),
+                        parse_mode="Markdown",
+                        reply_markup=build_keyboard(["Yes, that's my load", "No - enter details myself"], cols=1),
+                    )
+                    return JOB_CONFIRM
 
     # --- Fallback: manual v3 flow ---
     names = list(QUICK_POINTS.keys())
@@ -428,18 +458,18 @@ async def get_trailer(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def job_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    choice = update.message.text.strip()
-    options = context.user_data.get("job_options", {})
-    s = options.get(choice)
-    if s:
-        context.user_data["job_summary"] = s
-        context.user_data["collection"] = s["collection"]
-        mapped = match_country((s.get("collection_country") or "").strip())
+    if "yes" in update.message.text.lower():
+        # Collection known from job. Derive country from job if possible, else ask.
+        s = context.user_data.get("job_summary", {})
+        from_c = (s.get("from_c") or "").strip()
+        mapped = match_country(from_c) if from_c else None
+        if from_c.upper() == "EU":
+            mapped = None  # corridor-level, need real country for customs rules
         if mapped:
             context.user_data["country"] = mapped
             return await ask_port(update, context)
         return await ask_country(update, context)
-    # "None of these" or unrecognised choice - manual flow
+    # Driver says the job is wrong - manual flow
     names = list(QUICK_POINTS.keys())
     await update.message.reply_text(
         "No problem. Where did you *collect the load*? Tap one:",
