@@ -44,7 +44,7 @@ class MoveItAPI:
             self.session.auth = (MOVEIT_API_KEY, MOVEIT_API_PASSWORD)
         self.session.headers.update({"Accept": "application/json"})
 
-     def _get(self, path, params=None):
+    def _get(self, path, params=None):
         if not self.enabled:
             return None
         try:
@@ -52,14 +52,6 @@ class MoveItAPI:
             print(f"MoveIT API {path} -> {r.status_code}: {r.text[:300]}")
             if r.status_code == 200:
                 return r.json()
-        except Exception as e:
-            print(f"MoveIT API error on {path}: {e}")
-        return None
-        try:
-            r = self.session.get(f"{MOVEIT_BASE_URL}/{path.lstrip('/')}", params=params, timeout=10)
-            if r.status_code == 200:
-                return r.json()
-            print(f"MoveIT API {path} -> {r.status_code}")
         except Exception as e:
             print(f"MoveIT API error on {path}: {e}")
         return None
