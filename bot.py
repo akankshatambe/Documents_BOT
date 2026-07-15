@@ -1,7 +1,7 @@
 import os
 import csv
 import requests
-from datetime import datetime
+from datetime import datetime, date
 from telegram import Update, ReplyKeyboardMarkup, ReplyKeyboardRemove
 from telegram.ext import (
     Application,
@@ -16,9 +16,115 @@ BOT_TOKEN = os.environ.get("BOT_TOKEN")
 TEAMS_WEBHOOK = os.environ.get("TEAMS_WEBHOOK")
 
 # =====================================================================
-# QUICK BUTTONS - the everyday regulars, always shown first.
-# Format: "Button label": ("Town for geocoding", "Country", lat, lon)
+# MOVE IT API SETTINGS - all set in Railway Variables, never in code
+#   MOVEIT_BASE_URL   e.g. https://yourserver.moveit.ie/api/v1
+#   MOVEIT_API_KEY    the key the vendor issued
+#   MOVEIT_API_PASSWORD
+#   MOVEIT_AUTH_MODE  one of: basic | headers  (default: basic)
+#     basic   = HTTP Basic auth, key as username, password as password
+#     headers = sent as X-Api-Key / X-Api-Password request headers
+# If MOVEIT_BASE_URL is not set, the bot runs exactly like v3 (manual flow).
 # =====================================================================
+MOVEIT_BASE_URL = (os.environ.get("MOVEIT_BASE_URL") or "").rstrip("/")
+MOVEIT_API_KEY = os.environ.get("MOVEIT_API_KEY", "")
+MOVEIT_API_PASSWORD = os.environ.get("MOVEIT_API_PASSWORD", "")
+MOVEIT_AUTH_MODE = os.environ.get("MOVEIT_AUTH_MODE", "basic").lower()
+
+
+class MoveItAPI:
+    def __init__(self):
+        self.enabled = bool(MOVEIT_BASE_URL and MOVEIT_API_KEY)
+        self.session = requests.Session()
+        if MOVEIT_AUTH_MODE == "headers":
+            self.session.headers.update({
+                "X-Api-Key": MOVEIT_API_KEY,
+                "X-Api-Password": MOVEIT_API_PASSWORD,
+            })
+        else:
+            self.session.auth = (MOVEIT_API_KEY, MOVEIT_API_PASSWORD)
+        self.session.headers.update({"Accept": "application/json"})
+
+    def _get(self, path, params=None):
+        if not self.enabled:
+            return None
+        try:
+            r = self.session.get(f"{MOVEIT_BASE_URL}/{path.lstrip('/')}", params=params, timeout=10)
+            if r.status_code == 200:
+                return r.json()
+            print(f"MoveIT API {path} -> {r.status_code}")
+        except Exception as e:
+            print(f"MoveIT API error on {path}: {e}")
+        return None
+
+    def search_trailer(self, term):
+        data = self._get("trailer", params={"searchterm": term})
+        if isinstance(data, list) and data:
+            return data[0]
+        if isinstance(data, dict):
+            return data
+        return None
+
+    def todays_jobs(self):
+        today = date.today().strftime("%Y-%m-%d")
+        data = self._get("job", params={"fromdate": today, "todate": today})
+        return data if isinstance(data, list) else []
+
+    def ferry_ports(self):
+        data = self._get("ferryport")
+        return data if isinstance(data, list) else []
+
+
+API = MoveItAPI()
+
+
+def _norm(s):
+    return "".join(ch for ch in str(s).lower() if ch.isalnum())
+
+
+def _find_key(obj, *candidates):
+    """Case/format-insensitive field lookup - 'Job #', 'jobId', 'job_id' all match."""
+    if not isinstance(obj, dict):
+        return None
+    normed = {_norm(k): v for k, v in obj.items()}
+    for c in candidates:
+        if _norm(c) in normed:
+            return normed[_norm(c)]
+    return None
+
+
+def _as_text(value):
+    if value is None:
+        return None
+    if isinstance(value, dict):
+        return _find_key(value, "name", "code", "text", "description") or str(value)
+    return str(value)
+
+
+def extract_job_summary(job):
+    """Pull the useful fields out of a job record, whatever the exact schema."""
+    return {
+        "job_id": _find_key(job, "id", "jobid", "job #", "job_no", "jobnumber"),
+        "customer": _as_text(_find_key(job, "customer", "customer name", "client")),
+        "collection": _as_text(_find_key(job, "collection", "collectionaddress", "colladdress", "from_address")),
+        "delivery": _as_text(_find_key(job, "delivery", "deliveryaddress", "deladdress", "to_address")),
+        "from_c": _as_text(_find_key(job, "from", "fromcountry", "origin")),
+        "to_c": _as_text(_find_key(job, "to", "tocountry", "destination")),
+        "ferry": _as_text(_find_key(job, "ferrybooking", "ferry", "crossing")),
+    }
+
+
+def job_matches_trailer(job, trailer_code, trailer_id):
+    """Does this job reference our trailer? Checks common shapes defensively."""
+    t = _find_key(job, "trailer", "starttrailer", "finishtrailer", "trailercode")
+    if t is None:
+        return False
+    if isinstance(t, dict):
+        code = str(_find_key(t, "code", "registration") or "").upper()
+        tid = _find_key(t, "id")
+        return code == trailer_code.upper() or (trailer_id is not None and tid == trailer_id)
+    return trailer_code.upper() in str(t).upper()
+
+
 QUICK_POINTS = {
     "ABP Cahir":            ("Cahir", "Ireland", 52.3775, -7.9268),
     "G's Fresh Barway":     ("Barway, Ely", "UK", 52.3480, 0.2735),
@@ -30,12 +136,6 @@ QUICK_POINTS = {
     "RDV Marck":            ("Marck", "France", 50.9490, 1.9520),
 }
 
-# =====================================================================
-# FULL ADDRESS BOOK - optional locations.csv in the repo root.
-# Columns (with header row): Name,City,Country
-# Export from Move IT, save as CSV, upload to GitHub next to bot.py.
-# If the file is missing the bot still works with quick buttons + search.
-# =====================================================================
 ADDRESS_BOOK = []
 
 def load_address_book():
@@ -47,10 +147,12 @@ def load_address_book():
         with open(path, newline="", encoding="utf-8-sig") as f:
             for row in csv.DictReader(f):
                 name = (row.get("Name") or "").strip()
-                city = (row.get("City") or "").strip()
-                country = (row.get("Country") or "").strip()
                 if name:
-                    ADDRESS_BOOK.append({"name": name, "city": city, "country": country})
+                    ADDRESS_BOOK.append({
+                        "name": name,
+                        "city": (row.get("City") or "").strip(),
+                        "country": (row.get("Country") or "").strip(),
+                    })
         print(f"Loaded {len(ADDRESS_BOOK)} locations from locations.csv")
     except Exception as e:
         print(f"Could not load locations.csv: {e}")
@@ -91,11 +193,10 @@ PORTS = {
 EU_COUNTRIES = {"ireland", "france", "germany", "netherlands", "belgium", "spain", "italy", "poland"}
 NI_PORTS = {"Larne", "Belfast"}
 DIRECT_EU_PORTS = {"Cherbourg"}
-
 COUNTRY_OPTIONS = ["UK", "Northern Ireland", "Ireland", "France", "Germany",
                    "Netherlands", "Belgium", "Spain", "Italy", "Poland", "Other"]
 
-TRAILER, COLLECTION, COUNTRY, PORT, DOCS, NOTES, CONFIRM = range(7)
+TRAILER, JOB_CONFIRM, COLLECTION, COUNTRY, PORT, DOCS, NOTES, CONFIRM = range(8)
 
 
 def build_keyboard(items, cols=2, extra_row=None):
@@ -105,12 +206,22 @@ def build_keyboard(items, cols=2, extra_row=None):
     return ReplyKeyboardMarkup(rows, one_time_keyboard=True, resize_keyboard=True)
 
 
+def match_port(typed):
+    t = typed.lower().strip()
+    return next((p for p in PORTS if p.lower() == t or t in p.lower()), None)
+
+
+def match_country(typed):
+    t = typed.lower().strip()
+    return next((c for c in COUNTRY_OPTIONS if c.lower() == t), None)
+
+
 def geocode(place, country=""):
     try:
         r = requests.get(
             "https://nominatim.openstreetmap.org/search",
             params={"q": f"{place}, {country}", "format": "json", "limit": 1},
-            headers={"User-Agent": "OTooleTransportBot/3.0"},
+            headers={"User-Agent": "OTooleTransportBot/4.0"},
             timeout=8,
         )
         data = r.json()
@@ -147,13 +258,7 @@ def fmt_hours(hrs):
 
 
 def customs_needed(country, port):
-    """
-    Customs rules:
-    - NI -> GB (loading in Northern Ireland, sailing from Larne/Belfast): NO customs
-    - EU -> EU direct boat (EU collection, sailing from Cherbourg): NO customs
-    - Everything else (incl. GB -> NI via Cairnryan): customs required
-    """
-    c = country.lower().strip()
+    c = (country or "").lower().strip()
     if c == "northern ireland" and port in NI_PORTS:
         return False
     if port in DIRECT_EU_PORTS and c in EU_COUNTRIES and c != "ireland":
@@ -162,14 +267,16 @@ def customs_needed(country, port):
 
 
 def cmr_required(country):
-    """EU collections must photograph the CMR."""
-    return country.lower().strip() in (EU_COUNTRIES - {"ireland"})
+    return (country or "").lower().strip() in (EU_COUNTRIES - {"ireland"})
 
 
 def compute_route(context):
     d = context.user_data
-    lat, lon = d.get("col_lat"), d.get("col_lon")
     port = d.get("port")
+    # Prefer live trailer position over collection point
+    lat = d.get("live_lat") if d.get("live_lat") is not None else d.get("col_lat")
+    lon = d.get("live_lon") if d.get("live_lon") is not None else d.get("col_lon")
+    d["eta_source"] = "live trailer position" if d.get("live_lat") is not None else "collection point"
     if lat is None or port not in PORTS:
         d["dist_str"] = "Not calculated"
         d["prep_str"] = "-"
@@ -180,14 +287,13 @@ def compute_route(context):
         d["dist_str"] = "Not calculated"
         d["prep_str"] = "-"
         return
-    d["dist_str"] = f"{km} km | {fmt_hours(hrs)} drive"
+    d["dist_str"] = f"{km} km | {fmt_hours(hrs)} ({d['eta_source']})"
     d["prep_str"] = fmt_hours(max(0.0, hrs - 0.5))
 
 
 def post_to_teams(data):
     needs_customs = data.get("needs_customs", True)
     missing_cmr = data.get("cmr_missing", False)
-
     if not needs_customs:
         header, color = "Driver submission - no customs needed", "Good"
     elif missing_cmr:
@@ -199,12 +305,24 @@ def post_to_teams(data):
         {"title": "Trailer", "value": data.get("trailer", "-")},
         {"title": "Collection", "value": f"{data.get('collection', '-')} ({data.get('country', '-')})"},
         {"title": "Port", "value": data.get("port", "-")},
-        {"title": "Distance", "value": data.get("dist_str", "-")},
+        {"title": "Distance / ETA", "value": data.get("dist_str", "-")},
         {"title": "Time to prep docs", "value": data.get("prep_str", "-")},
         {"title": "Documents", "value": data.get("docs", "None")},
         {"title": "Notes", "value": data.get("notes", "None")},
         {"title": "Submitted", "value": data.get("submitted", "-")},
     ]
+    job = data.get("job_summary")
+    if job:
+        if job.get("job_id"):
+            facts.insert(1, {"title": "Move IT job", "value": str(job["job_id"])})
+        if job.get("customer"):
+            facts.insert(2, {"title": "Customer", "value": job["customer"]})
+        if job.get("delivery"):
+            facts.append({"title": "Delivery", "value": job["delivery"]})
+        if job.get("ferry"):
+            facts.append({"title": "Ferry booking", "value": job["ferry"]})
+    if data.get("live_text"):
+        facts.append({"title": "Trailer last seen", "value": data["live_text"]})
 
     card = {
         "$schema": "http://adaptivecards.io/schemas/adaptive-card.json",
@@ -250,12 +368,70 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def get_trailer(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.user_data["trailer"] = update.message.text.strip().upper()
+    trailer_code = update.message.text.strip().upper()
+    context.user_data["trailer"] = trailer_code
+
+    # --- Move IT lookup: trailer + live position + today's job ---
+    if API.enabled:
+        trailer = API.search_trailer(trailer_code)
+        if trailer:
+            loc = _find_key(trailer, "trackinglocation")
+            if isinstance(loc, dict) and _find_key(loc, "lat") is not None:
+                context.user_data["live_lat"] = _find_key(loc, "lat")
+                context.user_data["live_lon"] = _find_key(loc, "lon")
+                text = _find_key(loc, "locationtext")
+                when = _find_key(loc, "recordedon")
+                context.user_data["live_text"] = f"{text or ''} {('(' + str(when)[:16] + ')') if when else ''}".strip()
+
+            trailer_id = _find_key(trailer, "id")
+            for job in API.todays_jobs():
+                if job_matches_trailer(job, trailer_code, trailer_id):
+                    s = extract_job_summary(job)
+                    context.user_data["job_summary"] = s
+                    if s.get("collection"):
+                        context.user_data["collection"] = s["collection"]
+                    lines = [f"*Found your job in Move IT:*\n"]
+                    if s.get("customer"):
+                        lines.append(f"Customer: {s['customer']}")
+                    if s.get("collection"):
+                        lines.append(f"Collection: {s['collection']}")
+                    if s.get("delivery"):
+                        lines.append(f"Delivery: {s['delivery']}")
+                    lines.append("\nIs this your load?")
+                    await update.message.reply_text(
+                        "\n".join(lines),
+                        parse_mode="Markdown",
+                        reply_markup=build_keyboard(["Yes, that's my load", "No - enter details myself"], cols=1),
+                    )
+                    return JOB_CONFIRM
+
+    # --- Fallback: manual v3 flow ---
     names = list(QUICK_POINTS.keys())
     hint = "\n\nOr *type a few letters* to search all locations." if ADDRESS_BOOK else ""
     await update.message.reply_text(
-        f"Trailer *{context.user_data['trailer']}* noted.\n\n"
-        f"Where did you *collect the load*? Tap one:{hint}",
+        f"Trailer *{trailer_code}* noted.\n\nWhere did you *collect the load*? Tap one:{hint}",
+        parse_mode="Markdown",
+        reply_markup=build_keyboard(names, cols=2, extra_row=["Other location"]),
+    )
+    return COLLECTION
+
+
+async def job_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if "yes" in update.message.text.lower():
+        # Collection known from job. Derive country from job if possible, else ask.
+        s = context.user_data.get("job_summary", {})
+        from_c = (s.get("from_c") or "").strip()
+        mapped = match_country(from_c) if from_c else None
+        if from_c.upper() == "EU":
+            mapped = None  # corridor-level, need real country for customs rules
+        if mapped:
+            context.user_data["country"] = mapped
+            return await ask_port(update, context)
+        return await ask_country(update, context)
+    # Driver says the job is wrong - manual flow
+    names = list(QUICK_POINTS.keys())
+    await update.message.reply_text(
+        "No problem. Where did you *collect the load*? Tap one:",
         parse_mode="Markdown",
         reply_markup=build_keyboard(names, cols=2, extra_row=["Other location"]),
     )
@@ -267,8 +443,6 @@ async def get_collection(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if choice in QUICK_POINTS:
         town, country, lat, lon = QUICK_POINTS[choice]
-        if lat is None:
-            lat, lon = geocode(town, country)
         context.user_data.update(
             {"collection": choice, "country": country, "col_lat": lat, "col_lon": lon}
         )
@@ -303,13 +477,12 @@ async def get_collection(update: Update, context: ContextTypes.DEFAULT_TYPE):
     results = search_locations(choice)
     if results:
         context.user_data["last_query"] = choice
-        labels = []
-        matches = {}
+        labels, m = [], {}
         for loc in results:
             label = f"{loc['name']} - {loc['city']}"[:60] if loc["city"] else loc["name"][:60]
             labels.append(label)
-            matches[label] = loc
-        context.user_data["search_matches"] = matches
+            m[label] = loc
+        context.user_data["search_matches"] = m
         await update.message.reply_text(
             f"Found these for *{choice}* - tap one:",
             parse_mode="Markdown",
@@ -323,7 +496,7 @@ async def get_collection(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def ask_country(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "Which *country* is that in?",
+        "Which *country* did you load in?",
         parse_mode="Markdown",
         reply_markup=build_keyboard(COUNTRY_OPTIONS, cols=3),
     )
@@ -331,9 +504,10 @@ async def ask_country(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def get_country(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.user_data["country"] = update.message.text.strip()
-    if context.user_data.get("col_lat") is None:
-        lat, lon = geocode(context.user_data["collection"], context.user_data["country"])
+    typed = update.message.text.strip()
+    context.user_data["country"] = match_country(typed) or typed
+    if context.user_data.get("col_lat") is None and context.user_data.get("live_lat") is None:
+        lat, lon = geocode(context.user_data.get("collection", ""), context.user_data["country"])
         context.user_data["col_lat"] = lat
         context.user_data["col_lon"] = lon
     return await ask_port(update, context)
@@ -349,7 +523,8 @@ async def ask_port(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def get_port(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.user_data["port"] = update.message.text.strip()
+    typed = update.message.text.strip()
+    context.user_data["port"] = match_port(typed) or typed
     context.user_data["chat_id"] = update.effective_chat.id
 
     country = context.user_data.get("country", "")
@@ -432,8 +607,11 @@ async def get_notes(update: Update, context: ContextTypes.DEFAULT_TYPE):
         status_line = "\nCMR missing - the team will follow up\n"
     else:
         status_line = ""
+    job = d.get("job_summary") or {}
+    job_line = f"Job: {job['job_id']}\n" if job.get("job_id") else ""
     summary = (
         f"*Please check your summary:*\n{status_line}\n"
+        f"{job_line}"
         f"Trailer: *{d.get('trailer')}*\n"
         f"Collection: {d.get('collection')} ({d.get('country')})\n"
         f"Port: {d.get('port')}\n"
@@ -478,22 +656,24 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 def main():
     load_address_book()
+    print(f"Move IT API: {'ENABLED at ' + MOVEIT_BASE_URL if API.enabled else 'not configured - manual flow only'}")
     app = Application.builder().token(BOT_TOKEN).build()
     conv = ConversationHandler(
         entry_points=[CommandHandler("start", start), MessageHandler(filters.TEXT & ~filters.COMMAND, start)],
         states={
-            TRAILER:    [MessageHandler(filters.TEXT & ~filters.COMMAND, get_trailer)],
-            COLLECTION: [MessageHandler(filters.TEXT & ~filters.COMMAND, get_collection)],
-            COUNTRY:    [MessageHandler(filters.TEXT & ~filters.COMMAND, get_country)],
-            PORT:       [MessageHandler(filters.TEXT & ~filters.COMMAND, get_port)],
-            DOCS:       [MessageHandler(filters.TEXT | filters.PHOTO | filters.Document.ALL, get_docs)],
-            NOTES:      [MessageHandler(filters.TEXT & ~filters.COMMAND, get_notes)],
-            CONFIRM:    [MessageHandler(filters.TEXT & ~filters.COMMAND, confirm)],
+            TRAILER:     [MessageHandler(filters.TEXT & ~filters.COMMAND, get_trailer)],
+            JOB_CONFIRM: [MessageHandler(filters.TEXT & ~filters.COMMAND, job_confirm)],
+            COLLECTION:  [MessageHandler(filters.TEXT & ~filters.COMMAND, get_collection)],
+            COUNTRY:     [MessageHandler(filters.TEXT & ~filters.COMMAND, get_country)],
+            PORT:        [MessageHandler(filters.TEXT & ~filters.COMMAND, get_port)],
+            DOCS:        [MessageHandler(filters.TEXT | filters.PHOTO | filters.Document.ALL, get_docs)],
+            NOTES:       [MessageHandler(filters.TEXT & ~filters.COMMAND, get_notes)],
+            CONFIRM:     [MessageHandler(filters.TEXT & ~filters.COMMAND, confirm)],
         },
         fallbacks=[CommandHandler("cancel", cancel)],
     )
     app.add_handler(conv)
-    print("Bot v3 is running...")
+    print("Bot v4 is running...")
     app.run_polling()
 
 
