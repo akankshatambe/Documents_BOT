@@ -1,7 +1,8 @@
 import os
 import csv
 import requests
-from datetime import datetime, date
+from datetime import datetime, date, timedelta
+import time
 from telegram import Update, ReplyKeyboardMarkup, ReplyKeyboardRemove
 from telegram.ext import (
     Application,
@@ -67,6 +68,12 @@ class MoveItAPI:
     def todays_jobs(self):
         today = date.today().strftime("%Y-%m-%d")
         data = self._get("job", params={"fromdate": today, "todate": today})
+        return data if isinstance(data, list) else []
+
+    def job_history(self, days=90):
+        fromdate = (date.today() - timedelta(days=days)).strftime("%Y-%m-%d")
+        todate = date.today().strftime("%Y-%m-%d")
+        data = self._get("job", params={"fromdate": fromdate, "todate": todate})
         return data if isinstance(data, list) else []
 
     def ferry_ports(self):
@@ -166,7 +173,7 @@ def job_matches_trailer(job, trailer_code, trailer_id):
     return False
 
 
-QUICK_POINTS = {
+FALLBACK_QUICK_POINTS = {
     "ABP Cahir":            ("Cahir", "Ireland", 52.3775, -7.9268),
     "G's Fresh Barway":     ("Barway, Ely", "UK", 52.3480, 0.2735),
     "Florette Lichfield":   ("Lichfield", "UK", 52.6816, -1.8317),
@@ -176,6 +183,8 @@ QUICK_POINTS = {
     "Clarebout Mouscron":   ("Mouscron", "Belgium", 50.7439, 3.2062),
     "RDV Marck":            ("Marck", "France", 50.9490, 1.9520),
 }
+
+QUICK_POINTS = dict(FALLBACK_QUICK_POINTS)
 
 ADDRESS_BOOK = []
 
@@ -215,7 +224,7 @@ def search_locations(query, limit=8):
     return (starts + contains)[:limit]
 
 
-PORTS = {
+FALLBACK_PORTS = {
     "Dublin Port":  (53.3456, -6.2045),
     "Rosslare":     (52.2519, -6.3387),
     "Holyhead":     (53.3090, -4.6329),
@@ -231,11 +240,55 @@ PORTS = {
     "Belfast":      (54.6079, -5.9264),
 }
 
+PORTS = dict(FALLBACK_PORTS)
+
 EU_COUNTRIES = {"ireland", "france", "germany", "netherlands", "belgium", "spain", "italy", "poland"}
 NI_PORTS = {"Larne", "Belfast"}
 DIRECT_EU_PORTS = {"Cherbourg"}
 COUNTRY_OPTIONS = ["UK", "Northern Ireland", "Ireland", "France", "Germany",
                    "Netherlands", "Belgium", "Spain", "Italy", "Poland", "Other"]
+
+
+def _resolve_named_ports(keywords):
+    """Map known keyword ports (e.g. 'Belfast') to whatever name the live API actually returned,
+    so customs logic keeps working even if Move IT's naming differs slightly (e.g. 'Belfast Terminal')."""
+    resolved = set()
+    for kw in keywords:
+        match = next((p for p in PORTS if kw.lower() in p.lower()), None)
+        resolved.add(match or kw)
+    return resolved
+
+
+def load_ports_from_api():
+    """Populate PORTS from Move IT's ferryport endpoint; falls back to the static list on any failure."""
+    global PORTS, NI_PORTS, DIRECT_EU_PORTS
+    if not API.enabled:
+        print("Move IT API disabled - using fallback ports list")
+        return
+    data = API.ferry_ports()
+    if not data:
+        print("No ferry ports returned from Move IT - using fallback ports list")
+        return
+
+    loaded = {}
+    for p in data:
+        name = _as_text(_find_key(p, "name", "portname", "code"))
+        lat = _find_key(p, "lat", "latitude")
+        lon = _find_key(p, "lon", "lng", "longitude")
+        if name and lat is not None and lon is not None:
+            try:
+                loaded[name] = (float(lat), float(lon))
+            except (TypeError, ValueError):
+                continue
+
+    if not loaded:
+        print("Ferry port data had no usable name/lat/lon - using fallback ports list")
+        return
+
+    PORTS = loaded
+    NI_PORTS = _resolve_named_ports({"Larne", "Belfast"})
+    DIRECT_EU_PORTS = _resolve_named_ports({"Cherbourg"})
+    print(f"Loaded {len(PORTS)} ports from Move IT ferryport endpoint")
 
 TRAILER, JOB_CONFIRM, COLLECTION, COUNTRY, PORT, DOCS, NOTES, CONFIRM = range(8)
 
@@ -271,6 +324,67 @@ def geocode(place, country=""):
     except Exception as e:
         print(f"Geocode error: {e}")
     return None, None
+
+
+_GEOCODE_CACHE = {}
+
+
+def _cached_geocode(place, country=""):
+    key = f"{place}|{country}".lower()
+    if key not in _GEOCODE_CACHE:
+        _GEOCODE_CACHE[key] = geocode(place, country)
+        time.sleep(1)  # respect Nominatim's 1 req/sec usage policy
+    return _GEOCODE_CACHE[key]
+
+
+def build_frequent_collection_points(days=90, top_n=16, min_count=1):
+    """Walk Move IT job history and rank collection addresses by how often they're actually used,
+    replacing the static QUICK_POINTS buttons with real, current data."""
+    global QUICK_POINTS
+    if not API.enabled:
+        print("Move IT API disabled - using fallback quick points")
+        return
+
+    jobs = API.job_history(days=days)
+    if not jobs:
+        print("No job history returned from Move IT - using fallback quick points")
+        return
+
+    tally = {}
+    for job in jobs:
+        for stop in _find_key(job, "stops") or []:
+            if "collect" not in _stop_action_text(stop):
+                continue
+            addr = _find_key(stop, "address")
+            if not isinstance(addr, dict):
+                continue
+            code = _find_key(addr, "code")
+            name = _as_text(_find_key(addr, "name")) or code
+            if not code or not name:
+                continue
+            country = _as_text(_find_key(addr, "country", "countrycode")) or ""
+            entry = tally.setdefault(code, {"name": name, "country": country, "count": 0})
+            entry["count"] += 1
+
+    ranked = sorted(tally.values(), key=lambda e: e["count"], reverse=True)
+    ranked = [e for e in ranked if e["count"] >= min_count][:top_n]
+    if not ranked:
+        print("No collection stops found in job history - using fallback quick points")
+        return
+
+    built = {}
+    for e in ranked:
+        lat, lon = _cached_geocode(e["name"], e["country"])
+        if lat is None:
+            continue
+        built[e["name"]] = (e["name"], e["country"], lat, lon)
+
+    if built:
+        QUICK_POINTS = built
+        print(f"Loaded {len(QUICK_POINTS)} frequent collection points from Move IT job history "
+              f"(last {days} days, {len(jobs)} jobs scanned)")
+    else:
+        print("Could not geocode any frequent collection points - using fallback quick points")
 
 
 def route_info(from_lat, from_lon, to_lat, to_lon):
@@ -487,6 +601,8 @@ async def get_collection(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.user_data.update(
             {"collection": choice, "country": country, "col_lat": lat, "col_lon": lon}
         )
+        if not country:
+            return await ask_country(update, context)
         return await ask_port(update, context)
 
     if choice == "Other location":
@@ -697,6 +813,8 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 def main():
     load_address_book()
+    load_ports_from_api()
+    build_frequent_collection_points()
     print(f"Move IT API: {'ENABLED at ' + MOVEIT_BASE_URL if API.enabled else 'not configured - manual flow only'}")
     app = Application.builder().token(BOT_TOKEN).build()
     conv = ConversationHandler(
