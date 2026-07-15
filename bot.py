@@ -49,7 +49,7 @@ class MoveItAPI:
             return None
         try:
             r = self.session.get(f"{MOVEIT_BASE_URL}/{path.lstrip('/')}", params=params, timeout=10)
-            print(f"MoveIT API {path} -> {r.status_code}: {r.text[:300]}")
+            print(f"MoveIT API {path} -> {r.status_code}: {r.text[:4000]}")
             if r.status_code == 200:
                 return r.json()
         except Exception as e:
