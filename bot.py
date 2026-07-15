@@ -45,11 +45,11 @@ class MoveItAPI:
             self.session.auth = (MOVEIT_API_KEY, MOVEIT_API_PASSWORD)
         self.session.headers.update({"Accept": "application/json"})
 
-    def _get(self, path, params=None):
+    def _get(self, path, params=None, timeout=10):
         if not self.enabled:
             return None
         try:
-            r = self.session.get(f"{MOVEIT_BASE_URL}/{path.lstrip('/')}", params=params, timeout=10)
+            r = self.session.get(f"{MOVEIT_BASE_URL}/{path.lstrip('/')}", params=params, timeout=timeout)
             print(f"MoveIT API {path} -> {r.status_code}: {r.text[:300]}")
             if r.status_code == 200:
                 return r.json()
@@ -70,11 +70,48 @@ class MoveItAPI:
         data = self._get("job", params={"fromdate": today, "todate": today})
         return data if isinstance(data, list) else []
 
-    def job_history(self, days=90):
-        fromdate = (date.today() - timedelta(days=days)).strftime("%Y-%m-%d")
-        todate = date.today().strftime("%Y-%m-%d")
-        data = self._get("job", params={"fromdate": fromdate, "todate": todate})
-        return data if isinstance(data, list) else []
+    def job_history(self, days=90, chunk_days=7):
+        """Pull job history in small windows. Move IT's job endpoint 500s
+        ('DBNull to Date') if any job in the requested range has a null date,
+        so failed chunks are retried day-by-day and only the poisoned days skipped."""
+        all_jobs, seen_ids = [], set()
+        bad_days = 0
+        end = date.today()
+        cur = end - timedelta(days=days)
+
+        def _collect(data):
+            nonlocal all_jobs
+            for j in data:
+                jid = _find_key(j, "id", "jobid")
+                if jid is None or jid not in seen_ids:
+                    if jid is not None:
+                        seen_ids.add(jid)
+                    all_jobs.append(j)
+
+        while cur <= end:
+            chunk_end = min(cur + timedelta(days=chunk_days - 1), end)
+            data = self._get("job", params={
+                "fromdate": cur.strftime("%Y-%m-%d"),
+                "todate": chunk_end.strftime("%Y-%m-%d"),
+            }, timeout=30)
+            if isinstance(data, list):
+                _collect(data)
+            else:
+                # Chunk failed (likely a null-date job) - retry each day, skip the bad ones.
+                d = cur
+                while d <= chunk_end:
+                    ds = d.strftime("%Y-%m-%d")
+                    daily = self._get("job", params={"fromdate": ds, "todate": ds}, timeout=30)
+                    if isinstance(daily, list):
+                        _collect(daily)
+                    else:
+                        bad_days += 1
+                    d += timedelta(days=1)
+            cur = chunk_end + timedelta(days=1)
+
+        if bad_days:
+            print(f"[job-history] skipped {bad_days} day(s) that Move IT could not serve (null-date records)")
+        return all_jobs
 
     def ferry_ports(self):
         data = self._get("ferryport")
@@ -193,9 +230,11 @@ def load_address_book():
     if not os.path.exists(path):
         print("No locations.csv found - running with quick buttons only")
         return
-    try:
-        with open(path, newline="", encoding="utf-8-sig") as f:
-            for row in csv.DictReader(f):
+    for enc in ("utf-8-sig", "cp1252", "latin-1"):
+        try:
+            with open(path, newline="", encoding=enc) as f:
+                rows = list(csv.DictReader(f))
+            for row in rows:
                 name = (row.get("Name") or "").strip()
                 if name:
                     ADDRESS_BOOK.append({
@@ -203,9 +242,14 @@ def load_address_book():
                         "city": (row.get("City") or "").strip(),
                         "country": (row.get("Country") or "").strip(),
                     })
-        print(f"Loaded {len(ADDRESS_BOOK)} locations from locations.csv")
-    except Exception as e:
-        print(f"Could not load locations.csv: {e}")
+            print(f"Loaded {len(ADDRESS_BOOK)} locations from locations.csv (encoding: {enc})")
+            return
+        except UnicodeDecodeError:
+            continue
+        except Exception as e:
+            print(f"Could not load locations.csv: {e}")
+            return
+    print("Could not load locations.csv: unknown text encoding")
 
 
 def search_locations(query, limit=8):
@@ -272,14 +316,31 @@ def load_ports_from_api():
 
     loaded = {}
     for p in data:
-        name = _as_text(_find_key(p, "name", "portname", "code"))
-        lat = _find_key(p, "lat", "latitude")
-        lon = _find_key(p, "lon", "lng", "longitude")
+        addr = _find_key(p, "address")
+        addr = addr if isinstance(addr, dict) else {}
+        # Per the live API, the friendly name and coordinates live inside address;
+        # fall back to top-level fields just in case.
+        name = (_as_text(_find_key(addr, "name")) or _as_text(_find_key(p, "name", "portname", "code")) or "").strip()
+        lat = _find_key(addr, "lat", "latitude")
+        lon = _find_key(addr, "lon", "lng", "longitude")
+        if lat is None:
+            lat = _find_key(p, "lat", "latitude")
+        if lon is None:
+            lon = _find_key(p, "lon", "lng", "longitude")
         if name and lat is not None and lon is not None:
             try:
                 loaded[name] = (float(lat), float(lon))
             except (TypeError, ValueError):
                 continue
+            # Remember every identifier this port goes by, for matching against job records.
+            addr_code = _find_key(addr, "code")
+            if addr_code:
+                PORT_ADDR_CODES[_norm(addr_code)] = name
+            for alias in (name, _find_key(p, "code"), _find_key(p, "name"),
+                          addr_code, _find_key(addr, "town")):
+                a = _norm(alias or "")
+                if len(a) >= 4:
+                    PORT_ALIASES[a] = name
 
     if not loaded:
         print("Ferry port data had no usable name/lat/lon - using fallback ports list")
@@ -289,6 +350,79 @@ def load_ports_from_api():
     NI_PORTS = _resolve_named_ports({"Larne", "Belfast"})
     DIRECT_EU_PORTS = _resolve_named_ports({"Cherbourg"})
     print(f"Loaded {len(PORTS)} ports from Move IT ferryport endpoint")
+
+
+PORT_ALIASES = {}      # normalized alias -> canonical port name
+PORT_ADDR_CODES = {}   # normalized ferryport address code -> canonical port name
+TOP_PORTS = []         # most-used ports (keyboard order); empty = show all
+
+
+_FERRYISH = ("ferry", "boat", "tunnel", "crossing", "sail", "port", "checkin", "check-in")
+
+
+def rank_ports_by_usage(jobs, top_n=10):
+    """Rank ports by how often job history references them. Only trusted evidence counts:
+    the job's ferry/crossing field, an exact ferryport address-code match on a stop,
+    or a ferry/tunnel-type stop action. Plain delivery addresses in a port town don't count."""
+    global TOP_PORTS
+    if not jobs:
+        print("[port-rank] no job history - keyboard will show all ports")
+        return
+
+    aliases = dict(PORT_ALIASES)
+    for name in PORTS:  # ensure fallback-mode port names are matchable too
+        aliases.setdefault(_norm(name), name)
+
+    def _fuzzy(text):
+        n = _norm(text or "")
+        if not n:
+            return None
+        if n in aliases:
+            return aliases[n]
+        return next((pname for a, pname in aliases.items() if a in n or n in a), None)
+
+    def _fuzzy_all(text):
+        """A ferry booking like 'Dublin Port - Holyhead 22:30' names both ends - match every port in it."""
+        n = _norm(text or "")
+        if not n:
+            return set()
+        return {pname for a, pname in aliases.items() if a in n}
+
+    counts, matched_jobs = {}, 0
+    for job in jobs:
+        hits = set()
+        ferry_text = _as_text(_find_key(job, "ferrybooking", "ferry", "crossing"))
+        if ferry_text:
+            hits |= _fuzzy_all(ferry_text)
+        for stop in _find_key(job, "stops") or []:
+            addr = _find_key(stop, "address")
+            addr = addr if isinstance(addr, dict) else {}
+            code = _norm(_find_key(addr, "code") or "")
+            if code and code in PORT_ADDR_CODES:
+                hits.add(PORT_ADDR_CODES[code])
+                continue
+            action = _stop_action_text(stop)
+            if any(k in action for k in _FERRYISH):
+                hit = _fuzzy(_find_key(addr, "name")) or _fuzzy(_find_key(addr, "town")) or _fuzzy(_find_key(addr, "code"))
+                if hit:
+                    hits.add(hit)
+        if hits:
+            matched_jobs += 1
+            for p in hits:
+                counts[p] = counts.get(p, 0) + 1
+
+    if not counts:
+        print("[port-rank] no port references found in job history - keyboard will show all ports")
+        return
+
+    ranked = sorted(counts.items(), key=lambda kv: kv[1], reverse=True)
+    TOP_PORTS = [p for p, _ in ranked[:top_n]]
+    print(f"[port-rank] {matched_jobs}/{len(jobs)} jobs referenced a port; "
+          f"top {len(TOP_PORTS)}: {ranked[:top_n]}")
+
+
+def port_keyboard_names():
+    return TOP_PORTS if TOP_PORTS else list(PORTS.keys())
 
 TRAILER, JOB_CONFIRM, COLLECTION, COUNTRY, PORT, DOCS, NOTES, CONFIRM = range(8)
 
@@ -337,54 +471,77 @@ def _cached_geocode(place, country=""):
     return _GEOCODE_CACHE[key]
 
 
-def build_frequent_collection_points(days=90, top_n=16, min_count=1):
+def build_frequent_collection_points(days=90, top_n=16, min_count=1, jobs=None):
     """Walk Move IT job history and rank collection addresses by how often they're actually used,
     replacing the static QUICK_POINTS buttons with real, current data."""
     global QUICK_POINTS
     if not API.enabled:
-        print("Move IT API disabled - using fallback quick points")
+        print("[freq-points] Move IT API disabled - using fallback quick points")
         return
 
-    jobs = API.job_history(days=days)
+    if jobs is None:
+        jobs = API.job_history(days=days)
+    print(f"[freq-points] job_history returned {len(jobs)} jobs over last {days} days")
     if not jobs:
-        print("No job history returned from Move IT - using fallback quick points")
+        print("[freq-points] no jobs - trying shorter 30-day range in case the API limits the window")
+        jobs = API.job_history(days=30)
+        print(f"[freq-points] 30-day retry returned {len(jobs)} jobs")
+    if not jobs:
+        print("[freq-points] still no jobs - using fallback quick points")
         return
 
+    action_codes_seen = set()
+    stops_total = 0
     tally = {}
     for job in jobs:
         for stop in _find_key(job, "stops") or []:
+            stops_total += 1
+            action_codes_seen.add(_as_text(_find_key(stop, "stopaction", "action")) or "?")
             if "collect" not in _stop_action_text(stop):
                 continue
             addr = _find_key(stop, "address")
             if not isinstance(addr, dict):
+                print(f"[freq-points] collect stop had no address dict, keys were: {list(stop.keys())}")
                 continue
             code = _find_key(addr, "code")
             name = _as_text(_find_key(addr, "name")) or code
             if not code or not name:
+                print(f"[freq-points] address missing code/name, keys were: {list(addr.keys())}")
                 continue
             country = _as_text(_find_key(addr, "country", "countrycode")) or ""
-            entry = tally.setdefault(code, {"name": name, "country": country, "count": 0})
+            lat = _find_key(addr, "lat", "latitude")
+            lon = _find_key(addr, "lon", "lng", "longitude")
+            entry = tally.setdefault(code, {"name": name, "country": country,
+                                            "lat": lat, "lon": lon, "count": 0})
             entry["count"] += 1
+
+    print(f"[freq-points] scanned {stops_total} stops; action codes seen: {sorted(action_codes_seen)}")
+    print(f"[freq-points] tallied {len(tally)} distinct collection addresses")
 
     ranked = sorted(tally.values(), key=lambda e: e["count"], reverse=True)
     ranked = [e for e in ranked if e["count"] >= min_count][:top_n]
     if not ranked:
-        print("No collection stops found in job history - using fallback quick points")
+        print("[freq-points] no collection stops matched - check action codes above; using fallback quick points")
         return
 
     built = {}
     for e in ranked:
-        lat, lon = _cached_geocode(e["name"], e["country"])
+        lat, lon = e.get("lat"), e.get("lon")
+        if lat is None or lon is None:
+            lat, lon = _cached_geocode(e["name"], e["country"])
         if lat is None:
+            print(f"[freq-points] no coordinates for '{e['name']}' ({e['country'] or 'no country'}) - skipping")
             continue
-        built[e["name"]] = (e["name"], e["country"], lat, lon)
+        try:
+            built[e["name"]] = (e["name"], e["country"], float(lat), float(lon))
+        except (TypeError, ValueError):
+            continue
 
     if built:
         QUICK_POINTS = built
-        print(f"Loaded {len(QUICK_POINTS)} frequent collection points from Move IT job history "
-              f"(last {days} days, {len(jobs)} jobs scanned)")
+        print(f"[freq-points] SUCCESS: loaded {len(QUICK_POINTS)} frequent collection points: {list(QUICK_POINTS)}")
     else:
-        print("Could not geocode any frequent collection points - using fallback quick points")
+        print("[freq-points] geocoding failed for all candidates - using fallback quick points")
 
 
 def route_info(from_lat, from_lon, to_lat, to_lon):
@@ -671,10 +828,12 @@ async def get_country(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def ask_port(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    names = port_keyboard_names()
+    hint = "\n\nOr *type* any other port." if TOP_PORTS else ""
     await update.message.reply_text(
-        "Which *port* are you heading to?",
+        f"Which *port* are you heading to?{hint}",
         parse_mode="Markdown",
-        reply_markup=build_keyboard(list(PORTS.keys()), cols=2),
+        reply_markup=build_keyboard(names, cols=2),
     )
     return PORT
 
@@ -814,7 +973,9 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
 def main():
     load_address_book()
     load_ports_from_api()
-    build_frequent_collection_points()
+    history = API.job_history() if API.enabled else []
+    build_frequent_collection_points(jobs=history)
+    rank_ports_by_usage(history)
     print(f"Move IT API: {'ENABLED at ' + MOVEIT_BASE_URL if API.enabled else 'not configured - manual flow only'}")
     app = Application.builder().token(BOT_TOKEN).build()
     conv = ConversationHandler(
