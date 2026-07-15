@@ -261,7 +261,7 @@ def customs_needed(country, port):
     c = (country or "").lower().strip()
     if c == "northern ireland" and port in NI_PORTS:
         return False
-    if port in DIRECT_EU_PORTS and c in EU_COUNTRIES and c != "ireland":
+    if port in DIRECT_EU_PORTS and c in EU_COUNTRIES:
         return False
     return True
 
