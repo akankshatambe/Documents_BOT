@@ -74,7 +74,18 @@ def post_to_teams(data):
                                 {"title": "Driver chat ID", "value": str(data.get("chat_id", "—"))},
                             ]
                         }
-                    ]
+                    ],
+                    "actions": (
+                        [
+                            {
+                                "type": "Action.OpenUrl",
+                                "title": "📎 View uploaded document",
+                                "url": data["doc_url"],
+                            }
+                        ]
+                        if data.get("doc_url")
+                        else []
+                    ),
                 }
             }
         ]
@@ -135,12 +146,28 @@ async def get_port(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def get_docs(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.message.text and update.message.text.strip().lower() == "skip":
         context.user_data["docs"] = "None uploaded"
+        context.user_data["doc_url"] = None
     elif update.message.photo:
-        context.user_data["docs"] = "📷 Photo uploaded"
+        try:
+            file = await update.message.photo[-1].get_file()
+            context.user_data["doc_url"] = file.file_path
+            context.user_data["docs"] = "📷 Photo uploaded"
+        except Exception as e:
+            print(f"File fetch error: {e}")
+            context.user_data["doc_url"] = None
+            context.user_data["docs"] = "📷 Photo uploaded (link unavailable)"
     elif update.message.document:
-        context.user_data["docs"] = f"📄 {update.message.document.file_name}"
+        try:
+            file = await update.message.document.get_file()
+            context.user_data["doc_url"] = file.file_path
+            context.user_data["docs"] = f"📄 {update.message.document.file_name}"
+        except Exception as e:
+            print(f"File fetch error: {e}")
+            context.user_data["doc_url"] = None
+            context.user_data["docs"] = f"📄 {update.message.document.file_name} (link unavailable)"
     else:
         context.user_data["docs"] = update.message.text or "None uploaded"
+        context.user_data["doc_url"] = None
 
     await update.message.reply_text(
         "Any *additional notes* for the customs team?\n\nType them now or tap Skip 👇",
