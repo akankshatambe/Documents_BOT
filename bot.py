@@ -1,8 +1,6 @@
 import os
-import re
 import csv
 import requests
-import threading
 from datetime import datetime, date, timedelta
 import time
 from telegram import Update, ReplyKeyboardMarkup, ReplyKeyboardRemove
@@ -17,17 +15,6 @@ from telegram.ext import (
 
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
 TEAMS_WEBHOOK = os.environ.get("TEAMS_WEBHOOK")
-
-# --- PBN (Irish Revenue Customs RoRo) ---
-# Revenue's public look-up is a form POST (with CSRF token) returning HTML:
-#   POST https://www.ros.ie/customs-roro-control-web/ros/freight/lookup
-#   pbnID=YL22UY97&registrationNumber=&arrivalDate=16-07-2026&arrivalKey=&pbnLookUp=true&_csrf=...
-# The bot GETs the page for a CSRF token + session cookie, then POSTs the form.
-# ROS_PBN_URL can be overridden (e.g. to a proxy); a non-ros.ie URL uses generic GET/POST JSON mode.
-ROS_PBN_URL = os.environ.get("ROS_PBN_URL", "https://www.ros.ie/customs-roro-control-web/ros/freight/lookup")
-ROS_PBN_METHOD = os.environ.get("ROS_PBN_METHOD", "GET").upper()
-ROS_PBN_BODY = os.environ.get("ROS_PBN_BODY")
-PBN_LOOKUP_PAGE = "https://www.ros.ie/customs-roro-control-web/ros/freight/lookup"
 
 # =====================================================================
 # MOVE IT API SETTINGS - all set in Railway Variables, never in code
@@ -58,13 +45,12 @@ class MoveItAPI:
             self.session.auth = (MOVEIT_API_KEY, MOVEIT_API_PASSWORD)
         self.session.headers.update({"Accept": "application/json"})
 
-    def _get(self, path, params=None, timeout=10, quiet=False):
+    def _get(self, path, params=None, timeout=10):
         if not self.enabled:
             return None
         try:
             r = self.session.get(f"{MOVEIT_BASE_URL}/{path.lstrip('/')}", params=params, timeout=timeout)
-            if not quiet:
-                print(f"MoveIT API {path} -> {r.status_code}: {r.text[:300]}")
+            print(f"MoveIT API {path} -> {r.status_code}: {r.text[:300]}")
             if r.status_code == 200:
                 return r.json()
         except Exception as e:
@@ -83,11 +69,6 @@ class MoveItAPI:
         today = date.today().strftime("%Y-%m-%d")
         data = self._get("job", params={"fromdate": today, "todate": today})
         return data if isinstance(data, list) else []
-
-    def get_group(self, gid):
-        """Groups are Move IT's planning unit - they carry the driver/vehicle/trailer assignment."""
-        data = self._get(f"group/{gid}", quiet=True)
-        return data if isinstance(data, dict) else None
 
     def job_history(self, days=90, chunk_days=7):
         """Pull job history in small windows. Move IT's job endpoint 500s
@@ -112,7 +93,7 @@ class MoveItAPI:
             data = self._get("job", params={
                 "fromdate": cur.strftime("%Y-%m-%d"),
                 "todate": chunk_end.strftime("%Y-%m-%d"),
-            }, timeout=30, quiet=True)
+            }, timeout=30)
             if isinstance(data, list):
                 _collect(data)
             else:
@@ -120,7 +101,7 @@ class MoveItAPI:
                 d = cur
                 while d <= chunk_end:
                     ds = d.strftime("%Y-%m-%d")
-                    daily = self._get("job", params={"fromdate": ds, "todate": ds}, timeout=30, quiet=True)
+                    daily = self._get("job", params={"fromdate": ds, "todate": ds}, timeout=30)
                     if isinstance(daily, list):
                         _collect(daily)
                     else:
@@ -128,8 +109,8 @@ class MoveItAPI:
                     d += timedelta(days=1)
             cur = chunk_end + timedelta(days=1)
 
-        print(f"[job-history] pulled {len(all_jobs)} jobs over {days} days"
-              + (f"; {bad_days} day(s) unserveable (Move IT null-date records)" if bad_days else ""))
+        if bad_days:
+            print(f"[job-history] skipped {bad_days} day(s) that Move IT could not serve (null-date records)")
         return all_jobs
 
     def ferry_ports(self):
@@ -163,17 +144,6 @@ def _as_text(value):
     return str(value)
 
 
-def md(value):
-    """Escape Telegram Markdown-v1 special characters in dynamic text.
-    An unpaired _ * ` or [ in a filename or address makes the whole message
-    unsendable (400 'can't parse entities'), which kills the handler mid-conversation."""
-    return (str(value)
-            .replace("_", "\\_")
-            .replace("*", "\\*")
-            .replace("`", "\\`")
-            .replace("[", "\\["))
-
-
 def _stop_action_text(stop):
     return _norm(_as_text(_find_key(stop, "stopaction", "action")) or "")
 
@@ -202,77 +172,27 @@ def extract_job_summary(job):
         None,
     )
 
+    def _stop_country(stop):
+        addr = _find_key(stop, "address")
+        if isinstance(addr, dict):
+            return _as_text(_find_key(addr, "country", "countryname", "countrycode"))
+        return None
+
     return {
         "job_id": _find_key(job, "id", "jobid", "job #", "job_no", "jobnumber"),
         "customer": _as_text(_find_key(job, "customer", "customer name", "client")),
         "collection": _as_text(_find_key(collection_stop, "address")) if collection_stop else None,
-        "collection_country": (_as_text(_find_key(_find_key(collection_stop, "address") or {}, "country", "countrycode")) or "") if collection_stop else "",
         "delivery": _as_text(_find_key(delivery_stop, "address")) if delivery_stop else None,
         "collection_time": _find_key(collection_stop, "stopdatetime") if collection_stop else None,
         "delivery_time": _find_key(delivery_stop, "stopdatetime") if delivery_stop else None,
-        "from_c": _as_text(_find_key(job, "from", "fromcountry", "origin")),
-        "to_c": _as_text(_find_key(job, "to", "tocountry", "destination")),
+        # Country of the collection stop's address lets us skip the country question;
+        # top-level from/to kept as fallback for payloads that carry them.
+        "from_c": (_stop_country(collection_stop) if collection_stop else None)
+                  or _as_text(_find_key(job, "from", "fromcountry", "origin")),
+        "to_c": (_stop_country(delivery_stop) if delivery_stop else None)
+                or _as_text(_find_key(job, "to", "tocountry", "destination")),
         "ferry": _as_text(_find_key(job, "ferrybooking", "ferry", "crossing")),
     }
-
-
-_GROUP_CACHE = {}  # (date, gid) -> group JSON, so repeat lookups don't re-hit the API
-
-
-def _group_cached(gid):
-    key = (date.today(), gid)
-    if key not in _GROUP_CACHE:
-        _GROUP_CACHE[key] = API.get_group(gid)
-    return _GROUP_CACHE[key]
-
-
-def find_trailer_run(trailer_code, trailer_id):
-    """Trailer -> today's run, via groups (the planning unit that carries assignments):
-    today's jobs -> their groupids -> GET group/{gid} -> match Trailer id/code ->
-    every job sharing that groupid is a leg of this trailer's run."""
-    jobs = API.todays_jobs()
-    gids = []
-    for job in jobs:
-        for stop in _find_key(job, "stops") or []:
-            gid = _find_key(stop, "groupid")
-            if gid is not None and gid not in gids:
-                gids.append(gid)
-
-    code_n = _norm(trailer_code)
-    matched_gid = None
-    for gid in gids:
-        g = _group_cached(gid)
-        if not g or not _find_key(g, "hastrailer"):
-            continue
-        t = _find_key(g, "trailer")
-        if isinstance(t, dict):
-            if (trailer_id is not None and _find_key(t, "id") == trailer_id) or \
-               _norm(_as_text(_find_key(t, "code", "registration")) or "") == code_n:
-                matched_gid = gid
-                break
-        elif t is not None and _norm(str(t)) == code_n:
-            matched_gid = gid
-            break
-    if matched_gid is None:
-        return None
-
-    legs, combined_stops, customer = [], [], None
-    for job in jobs:
-        stops = _find_key(job, "stops") or []
-        if any(_find_key(s, "groupid") == matched_gid for s in stops):
-            legs.append(job)
-            combined_stops.extend(stops)
-            customer = customer or _as_text(_find_key(job, "customer"))
-
-    summary = extract_job_summary({"stops": combined_stops})
-    summary["customer"] = customer
-    summary["job_id"] = _find_key(legs[0], "id", "jobid") if legs else None
-    g = _group_cached(matched_gid)
-    drv = _find_key(g, "driver") if g else None
-    if isinstance(drv, dict):
-        name = " ".join(x for x in [_find_key(drv, "firstname"), _find_key(drv, "surname")] if x).strip()
-        summary["driver"] = name or _as_text(_find_key(drv, "code"))
-    return summary
 
 
 def job_matches_trailer(job, trailer_code, trailer_id):
@@ -379,9 +299,6 @@ PORTS = dict(FALLBACK_PORTS)
 EU_COUNTRIES = {"ireland", "france", "germany", "netherlands", "belgium", "spain", "italy", "poland"}
 NI_PORTS = {"Larne", "Belfast"}
 DIRECT_EU_PORTS = {"Cherbourg"}
-# GB <-> Ireland RoRo routes where Revenue's PBN applies
-_IRISH_SEA_KEYWORDS = {"Dublin", "Rosslare", "Holyhead", "Liverpool", "Fishguard", "Pembroke", "Heysham"}
-IRISH_SEA_PORTS = set(_IRISH_SEA_KEYWORDS)
 COUNTRY_OPTIONS = ["UK", "Northern Ireland", "Ireland", "France", "Germany",
                    "Netherlands", "Belgium", "Spain", "Italy", "Poland", "Other"]
 
@@ -439,10 +356,10 @@ def load_ports_from_api():
         print("Ferry port data had no usable name/lat/lon - using fallback ports list")
         return
 
-    # Curated geographic ports take precedence; API operator entries sit underneath
-    # so typed names still match and route coordinates still resolve.
-    PORTS = {**loaded, **dict(FALLBACK_PORTS)}
-    print(f"Loaded {len(loaded)} ferry entries from Move IT (keyboard stays on geographic ports)")
+    PORTS = loaded
+    NI_PORTS = _resolve_named_ports({"Larne", "Belfast"})
+    DIRECT_EU_PORTS = _resolve_named_ports({"Cherbourg"})
+    print(f"Loaded {len(PORTS)} ports from Move IT ferryport endpoint")
 
 
 PORT_ALIASES = {}      # normalized alias -> canonical port name
@@ -508,26 +425,55 @@ def rank_ports_by_usage(jobs, top_n=10):
         print("[port-rank] no port references found in job history - keyboard will show all ports")
         return
 
-    # Merge case/spelling twins ('NorthLink Ferries' vs 'Northlink Ferries') before ranking
-    merged = {}
-    for name, count in counts.items():
-        key = _norm(name)
-        if key in merged:
-            merged[key] = (merged[key][0], merged[key][1] + count)
-        else:
-            merged[key] = (name, count)
-    ranked = sorted(merged.values(), key=lambda kv: kv[1], reverse=True)
+    ranked = sorted(counts.items(), key=lambda kv: kv[1], reverse=True)
     TOP_PORTS = [p for p, _ in ranked[:top_n]]
     print(f"[port-rank] {matched_jobs}/{len(jobs)} jobs referenced a port; "
           f"top {len(TOP_PORTS)}: {ranked[:top_n]}")
 
 
 def port_keyboard_names():
-    """Drivers pick geographic ports, not ferry operators - the curated list is the keyboard.
-    API-loaded entries stay in PORTS so typed names still match and get coordinates."""
-    return list(FALLBACK_PORTS.keys())
+    return TOP_PORTS if TOP_PORTS else list(PORTS.keys())
 
-TRAILER, JOB_CONFIRM, COLLECTION, COUNTRY, PORT, PBN, DOCS, CONFIRM, RELAY = range(9)
+
+def suggested_port_from_job(job):
+    """Best-effort guess of THIS job's departure port so we can offer a one-tap
+    confirm. Uses the same trusted evidence as rank_ports_by_usage: ferryport
+    address codes and ferry-type stop actions (earliest such stop = departure),
+    else the first port named in the ferry/crossing text. Returns a PORTS key
+    or None (no suggestion -> driver just gets the normal port keyboard)."""
+    aliases = dict(PORT_ALIASES)
+    for name in PORTS:
+        aliases.setdefault(_norm(name), name)
+
+    # 1) Stops in time order: a ferry check-in stop names the departure port.
+    stops = _find_key(job, "stops") or []
+    stops = sorted((s for s in stops if isinstance(s, dict)),
+                   key=lambda s: str(_find_key(s, "stopdatetime") or ""))
+    for stop in stops:
+        addr = _find_key(stop, "address")
+        addr = addr if isinstance(addr, dict) else {}
+        code = _norm(_find_key(addr, "code") or "")
+        if code and code in PORT_ADDR_CODES:
+            return PORT_ADDR_CODES[code]
+        if any(k in _stop_action_text(stop) for k in _FERRYISH):
+            for field in ("name", "town", "code"):
+                n = _norm(_find_key(addr, field) or "")
+                if n and n in aliases:
+                    return aliases[n]
+
+    # 2) Ferry text like 'Dublin Port - Holyhead 22:30': first port named = departure.
+    ferry_text = _norm(_as_text(_find_key(job, "ferrybooking", "ferry", "crossing")) or "")
+    if ferry_text:
+        best, best_pos = None, len(ferry_text) + 1
+        for a, pname in aliases.items():
+            pos = ferry_text.find(a)
+            if pos != -1 and pos < best_pos:
+                best, best_pos = pname, pos
+        return best
+    return None
+
+
+TRAILER, JOB_CONFIRM, COLLECTION, COUNTRY, PORT, PORT_CONFIRM, DOCS, NOTES, CONFIRM = range(9)
 
 
 def build_keyboard(items, cols=2, extra_row=None):
@@ -545,6 +491,31 @@ def match_port(typed):
 def match_country(typed):
     t = typed.lower().strip()
     return next((c for c in COUNTRY_OPTIONS if c.lower() == t), None)
+
+
+# Free-text/ISO country values from Move IT (GB, IE, "United Kingdom", ...) -> our options.
+COUNTRY_ALIASES = {
+    "gb": "UK", "uk": "UK", "united kingdom": "UK", "great britain": "UK",
+    "england": "UK", "scotland": "UK", "wales": "UK", "gbr": "UK",
+    "ni": "Northern Ireland", "northern ireland": "Northern Ireland", "xi": "Northern Ireland",
+    "ie": "Ireland", "irl": "Ireland", "ireland": "Ireland",
+    "republic of ireland": "Ireland", "eire": "Ireland",
+    "fr": "France", "fra": "France", "france": "France",
+    "de": "Germany", "deu": "Germany", "germany": "Germany", "deutschland": "Germany",
+    "nl": "Netherlands", "nld": "Netherlands", "netherlands": "Netherlands", "holland": "Netherlands",
+    "be": "Belgium", "bel": "Belgium", "belgium": "Belgium",
+    "es": "Spain", "esp": "Spain", "spain": "Spain",
+    "it": "Italy", "ita": "Italy", "italy": "Italy",
+    "pl": "Poland", "pol": "Poland", "poland": "Poland",
+}
+
+
+def match_country_loose(typed):
+    """Accepts free-text/ISO country values from Move IT and maps to a COUNTRY_OPTION."""
+    if not typed:
+        return None
+    t = str(typed).lower().strip()
+    return COUNTRY_ALIASES.get(t) or match_country(t)
 
 
 def geocode(place, country=""):
@@ -706,216 +677,11 @@ def compute_route(context):
     d["prep_str"] = fmt_hours(max(0.0, hrs - 0.5))
 
 
-_GB_COUNTRIES = {"uk", "unitedkingdom", "greatbritain", "england", "scotland", "wales"}
-
-# Crossings that are definitely NOT GB<->Ireland (no PBN)
-_NON_IRISH_SEA = ("dover", "calais", "folkestone", "eurotunnel", "eurotunnell", "tunnel",
-                  "cherbourg", "hull", "zeebrugge", "rotterdam", "santander", "bilbao",
-                  "dunkirk", "dunkerque", "roscoff", "havre", "harwich", "hoek", "hookofholland",
-                  "frejus", "bardonecchia", "portsmouth", "newhaven", "dieppe")
-# Ports AND operators that (mostly) run GB<->Ireland
-_IRISH_SEA_HINTS = ("dublin", "rosslare", "holyhead", "liverpool", "fishguard", "pembroke",
-                    "heysham", "irishferries", "stena", "hibernia", "seatruck")
-
-
-def pbn_required(country, port, needs_customs):
-    """PBN applies to accompanied RoRo freight moving GB <-> Ireland.
-    Port names in Move IT are often ferry OPERATORS ('Irish Ferries', 'Stena Line Dub'),
-    so this errs toward True for GB/IE customs loads unless the crossing is clearly
-    elsewhere - an unused 'Check PBN channel' button is harmless, a missing one isn't."""
-    if not needs_customs:
-        return False
-    c = _norm(country or "")
-    if not (c in _GB_COUNTRIES or c == "ireland"):
-        return False
-    p = _norm(port or "")
-    if any(k in p for k in _NON_IRISH_SEA):
-        return False
-    if any(k in p for k in _IRISH_SEA_HINTS) or port in IRISH_SEA_PORTS:
-        return True
-    return True  # unclear name on a GB/IE customs load - offer the button
-
-
-def _deep_find_channel(obj):
-    """Search arbitrarily nested JSON for a channel/status value naming a colour."""
-    if isinstance(obj, dict):
-        val = _norm(_as_text(_find_key(obj, "channel", "status", "pbnchannel", "routing", "channeldescription")) or "")
-        for s in ("green", "orange", "red"):
-            if s in val:
-                return s
-        for v in obj.values():
-            found = _deep_find_channel(v)
-            if found:
-                return found
-    elif isinstance(obj, list):
-        for v in obj:
-            found = _deep_find_channel(v)
-            if found:
-                return found
-    return None
-
-
-def _map_ros_channel(blob):
-    """Map Revenue's channel wording to our status buckets."""
-    b = blob.lower()
-    if "exit" in b:
-        return "green"
-    if any(k in b for k in ("customs", "inspection", "dafm", "sps", "bip", "red")):
-        return "red"
-    if any(k in b for k in ("parking", "orange", "documentary")):
-        return "orange"
-    if any(k in b for k in ("not yet", "not available", "pending", "not released")):
-        return "pending"
-    return ""
-
-
-def _parse_ros_result(html):
-    """Parse Revenue's HTML result page. Reads both the visible channel label and the
-    FreightLookupResult debug comment (belt and braces - either may change)."""
-    low = html.lower()
-
-    fields = {}
-    m = re.search(r"freightlookupresult\((.*?)\)", low, re.S)
-    if m:
-        for part in m.group(1).split(","):
-            if "=" in part:
-                k, v = part.split("=", 1)
-                fields[k.strip()] = v.strip()
-
-    if fields.get("recordfound") == "false":
-        return "notfound", ""
-
-    mlab = re.search(r'laneresultlane[^"]*"\s*>\s*([^<]+)', low)
-    label = (mlab.group(1).strip() if mlab else "")
-    channel_raw = fields.get("channel", "").replace("_", " ")
-    lane_raw = fields.get("lane", "").replace("_", " ")
-    detail = (label or channel_raw).title()
-
-    status = _map_ros_channel(" ".join([label, channel_raw, lane_raw]))
-    if not status and fields.get("lanereleased") == "false":
-        return "pending", detail
-    if not status and ("no channel" in low or "not yet available" in low):
-        return "pending", detail
-    return (status or "unknown"), detail
-
-
-def _check_pbn_ros(pbn):
-    """Full ROS look-up flow: GET page (CSRF + session), then POST the form.
-    Tries today's arrival date, tomorrow's (after-midnight sailings), then blank."""
-    try:
-        s = requests.Session()
-        s.headers.update({
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) OTooleTransportBot/5.0",
-            "Accept": "text/html,application/xhtml+xml",
-        })
-        r = s.get(ROS_PBN_URL, timeout=15)
-        m = re.search(r'name="_csrf"[^>]*value="([^"]+)"', r.text)
-        csrf = m.group(1) if m else ""
-
-        last = ("unknown", "no response")
-        for ad in (date.today().strftime("%d-%m-%Y"),
-                   (date.today() + timedelta(days=1)).strftime("%d-%m-%Y"),
-                   ""):
-            form = {"pbnID": pbn, "registrationNumber": "", "arrivalDate": ad,
-                    "arrivalKey": "", "pbnLookUp": "true", "_csrf": csrf}
-            r2 = s.post(ROS_PBN_URL, data=form, timeout=15)
-            if r2.status_code != 200:
-                last = ("unknown", f"lookup returned HTTP {r2.status_code}")
-                continue
-            status, detail = _parse_ros_result(r2.text)
-            if status == "notfound":
-                last = ("unknown", "PBN not found - check the number")
-                continue
-            return status, detail
-        return last
-    except Exception as e:
-        return "unknown", str(e)
-
-
-def check_pbn_status(pbn):
-    """Check the PBN channel. Returns (status, detail);
-    status is green/orange/red/pending/unknown, detail is Revenue's official wording."""
-    if not ROS_PBN_URL:
-        return "unknown", "automatic check not configured"
-    if "ros.ie" in ROS_PBN_URL:
-        return _check_pbn_ros(pbn)
-    # Generic JSON endpoint mode (e.g. a proxy)
-    try:
-        url = (ROS_PBN_URL.format(pbn=pbn) if "{pbn}" in ROS_PBN_URL
-               else ROS_PBN_URL.rstrip("/") + "/" + pbn)
-        headers = {"Accept": "application/json",
-                   "User-Agent": "Mozilla/5.0 (OTooleTransportBot/5.0)"}
-        if ROS_PBN_METHOD == "POST":
-            body = (ROS_PBN_BODY or '{"pbnId": "{pbn}"}').replace("{pbn}", pbn)
-            headers["Content-Type"] = "application/json"
-            r = requests.post(url, data=body, headers=headers, timeout=10)
-        else:
-            r = requests.get(url, headers=headers, timeout=10)
-        if r.status_code == 404:
-            return "unknown", "PBN not found - check the number"
-        if r.status_code != 200:
-            return "unknown", f"lookup returned HTTP {r.status_code}"
-        # Prefer structured JSON if the endpoint returns it
-        try:
-            found = _deep_find_channel(r.json())
-            if found:
-                return found, ""
-        except ValueError:
-            pass
-        text = r.text.lower()
-        for s in ("green", "orange", "red"):
-            if re.search(rf"\b{s}\b", text):
-                return s, ""
-        if any(k in text for k in ("not available", "not yet", "pending", "no channel")):
-            return "pending", ""
-        return "unknown", "unrecognised response format"
-    except Exception as e:
-        return "unknown", str(e)
-
-
-def post_pbn_alert(data, status):
-    """Immediate compact Teams alert for red/orange/missing PBN - doesn't wait for
-    the driver to finish the flow, because the team needs lead time."""
-    labels = {"red": ("RED PBN - customs check required", "Attention"),
-              "orange": ("ORANGE PBN - documentary check required", "Warning"),
-              "missing": ("NO PBN - driver has no Pre-Boarding Notification", "Attention")}
-    header, color = labels.get(status, (f"PBN status: {status}", "Warning"))
-    facts = [
-        {"title": "Trailer", "value": data.get("trailer", "-")},
-        {"title": "PBN", "value": data.get("pbn") or "NOT PROVIDED"},
-        {"title": "Port", "value": data.get("port", "-")},
-        {"title": "Collection", "value": f"{data.get('collection', '-')} ({data.get('country', '-')})"},
-    ]
-    if data.get("live_text"):
-        facts.append({"title": "Trailer last seen", "value": data["live_text"]})
-    card = {
-        "$schema": "http://adaptivecards.io/schemas/adaptive-card.json",
-        "type": "AdaptiveCard", "version": "1.4",
-        "body": [
-            {"type": "Container", "style": "emphasis", "bleed": True,
-             "items": [{"type": "TextBlock", "text": header, "weight": "Bolder",
-                        "size": "Medium", "color": color, "wrap": True}]},
-            {"type": "FactSet", "facts": facts, "separator": True},
-        ],
-    }
-    body = {"type": "message",
-            "attachments": [{"contentType": "application/vnd.microsoft.card.adaptive", "content": card}]}
-    try:
-        r = requests.post(TEAMS_WEBHOOK, json=body, timeout=10)
-        return r.status_code in (200, 202)
-    except Exception as e:
-        print(f"Teams PBN alert error: {e}")
-        return False
-
-
 def post_to_teams(data):
     needs_customs = data.get("needs_customs", True)
     missing_cmr = data.get("cmr_missing", False)
-    pbn_status = data.get("pbn_status")
     if not needs_customs:
         header, color = "Driver submission - no customs needed", "Good"
-    elif pbn_status in ("red", "orange", "missing"):
-        header, color = f"Driver submission - customs required, PBN {pbn_status.upper()}", "Attention"
     elif missing_cmr:
         header, color = "Driver submission - customs required, CMR MISSING", "Warning"
     else:
@@ -931,9 +697,6 @@ def post_to_teams(data):
         {"title": "Notes", "value": data.get("notes", "None")},
         {"title": "Submitted", "value": data.get("submitted", "-")},
     ]
-    if data.get("pbn") or pbn_status:
-        facts.insert(3, {"title": "PBN",
-                         "value": f"{data.get('pbn') or 'NOT PROVIDED'} - {(pbn_status or 'unchecked').upper()}"})
     job = data.get("job_summary")
     if job:
         if job.get("job_id"):
@@ -944,8 +707,6 @@ def post_to_teams(data):
             facts.append({"title": "Delivery", "value": job["delivery"]})
         if job.get("ferry"):
             facts.append({"title": "Ferry booking", "value": job["ferry"]})
-        if job.get("driver"):
-            facts.append({"title": "Driver (Move IT)", "value": job["driver"]})
     if data.get("live_text"):
         facts.append({"title": "Trailer last seen", "value": data["live_text"]})
 
@@ -982,149 +743,8 @@ def post_to_teams(data):
         return False
 
 
-
-def post_submission_kb(pbn_route):
-    """Persistent keyboard left after submission - the driver's home screen."""
-    items = (["Check PBN channel"] if pbn_route else []) + ["Message the team", "New submission"]
-    return build_keyboard(items, cols=1)
-
-
-def post_driver_message(last, text, user):
-    """Relay a free-text driver message to the customs team on Teams."""
-    facts = [
-        {"title": "Trailer", "value": (last or {}).get("trailer") or "-"},
-        {"title": "Port", "value": (last or {}).get("port") or "-"},
-        {"title": "Driver", "value": (getattr(user, "full_name", None) or getattr(user, "username", None) or "-")},
-        {"title": "Message", "value": text},
-    ]
-    card = {
-        "$schema": "http://adaptivecards.io/schemas/adaptive-card.json",
-        "type": "AdaptiveCard", "version": "1.4",
-        "body": [
-            {"type": "Container", "style": "emphasis", "bleed": True,
-             "items": [{"type": "TextBlock", "text": "💬 Message from driver", "weight": "Bolder",
-                        "size": "Medium", "wrap": True}]},
-            {"type": "FactSet", "facts": facts, "separator": True},
-        ],
-    }
-    body = {"type": "message",
-            "attachments": [{"contentType": "application/vnd.microsoft.card.adaptive", "content": card}]}
-    try:
-        r = requests.post(TEAMS_WEBHOOK, json=body, timeout=10)
-        return r.status_code in (200, 202)
-    except Exception as e:
-        print(f"Teams driver message error: {e}")
-        return False
-
-
-async def relay_to_team(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = (update.message.text or "").strip()
-    last = context.user_data.get("last") or {}
-    kb = post_submission_kb(last.get("pbn_route", False))
-    if text.lower() == "cancel":
-        await update.message.reply_text("OK.", reply_markup=kb)
-        return ConversationHandler.END
-    ok = post_driver_message(last, text, update.effective_user)
-    await update.message.reply_text(
-        "✅ Sent to the customs team - they'll get back to you here." if ok
-        else "Couldn't send that - please call the customs team directly.",
-        reply_markup=kb,
-    )
-    return ConversationHandler.END
-
-
-ASSIGNMENTS = {"ts": 0.0, "by_trailer": {}}
-
-
-def refresh_assignments():
-    """Jobs carry no trailer, but every stop has a groupid, and GET group/{id}
-    returns that day's Driver/Vehicle/Trailer assignment. Build a trailer -> run map."""
-    if not API.enabled:
-        return
-    jobs = API.todays_jobs()
-    by_gid = {}
-    for job in jobs:
-        cust = _as_text(_find_key(job, "customer")) or ""
-        for stop in _find_key(job, "stops") or []:
-            gid = _find_key(stop, "groupid")
-            if gid is not None:
-                entry = by_gid.setdefault(gid, {"stops": [], "customer": cust})
-                entry["stops"].append(stop)
-                if cust and not entry["customer"]:
-                    entry["customer"] = cust
-    by_trailer = {}
-    for gid, entry in list(by_gid.items())[:200]:
-        g = API._get(f"group/{gid}", quiet=True)
-        if not isinstance(g, dict):
-            continue
-        t = _find_key(g, "trailer")
-        code = None
-        if isinstance(t, dict):
-            code = _find_key(t, "code", "registration")
-        elif isinstance(t, str):
-            code = t
-        if isinstance(code, str):
-            code = code.strip()
-        if code:
-            by_trailer[_norm(code)] = {
-                "group_id": gid,
-                "stops": entry["stops"],
-                "customer": entry["customer"],
-                "driver": _as_text(_find_key(g, "driver")) or "",
-            }
-    ASSIGNMENTS["by_trailer"] = by_trailer
-    ASSIGNMENTS["ts"] = time.time()
-    print(f"[assignments] {len(by_gid)} groups today, {len(by_trailer)} with trailers"
-          + (f": {sorted(by_trailer)[:8]}" if by_trailer else ""))
-
-
-def assignments_loop():
-    """Keeps the trailer -> run map warm so driver lookups are instant."""
-    while True:
-        try:
-            refresh_assignments()
-        except Exception as e:
-            print(f"[assignments] refresh failed: {e}")
-        time.sleep(600)
-
-
-def find_trailer_run(trailer_code, trailer_id):
-    """Instant lookup against the background-built map. Returns a job-style
-    summary of today's run for this trailer, or None."""
-    info = ASSIGNMENTS["by_trailer"].get(_norm(trailer_code or ""))
-    if not info:
-        return None
-    s = extract_job_summary({"stops": info["stops"]})
-    if info.get("customer") and not s.get("customer"):
-        s["customer"] = info["customer"]
-    if info.get("driver"):
-        s["driver"] = info["driver"]
-    return s
-
-
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    last = context.user_data.get("last")
     context.user_data.clear()
-    if last:
-        context.user_data["last"] = last
-    text = (update.message.text or "").strip().lower() if update.message else ""
-
-    if "check pbn" in text:
-        context.user_data["pbn_standalone"] = True
-        await update.message.reply_text(
-            "Type your *PBN ID* (e.g. YL22UY97) - it's on your booking:",
-            parse_mode="Markdown",
-            reply_markup=build_keyboard(["I don't have a PBN", "Cancel"], cols=1),
-        )
-        return PBN
-
-    if "message the team" in text:
-        await update.message.reply_text(
-            "Type your message for the customs team:",
-            reply_markup=build_keyboard(["Cancel"], cols=1),
-        )
-        return RELAY
-
     await update.message.reply_text(
         "Hi! I'm the O'Toole Transport customs bot.\n\nWhat is your *trailer number*?",
         parse_mode="Markdown",
@@ -1150,31 +770,33 @@ async def get_trailer(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 context.user_data["live_text"] = f"{text or ''} {('(' + str(when)[:16] + ')') if when else ''}".strip()
 
             trailer_id = _find_key(trailer, "id")
-
-            # Groups carry the trailer assignment - match today's run through them
-            s = find_trailer_run(trailer_code, trailer_id)
-            if s and s.get("collection"):
-                context.user_data["job_summary"] = s
-                context.user_data["collection"] = s["collection"]
-                lines = [f"*Found your run in Move IT:*\n"]
-                if s.get("customer"):
-                    lines.append(f"Customer: {md(s['customer'])}")
-                lines.append(f"Collection: {md(s['collection'])}")
-                if s.get("delivery"):
-                    lines.append(f"Delivery: {md(s['delivery'])}")
-                lines.append("\nIs this your load?")
-                await update.message.reply_text(
-                    "\n".join(lines),
-                    parse_mode="Markdown",
-                    reply_markup=build_keyboard(["Yes, that's my load", "No - enter details myself"], cols=1),
-                )
-                return JOB_CONFIRM
+            for job in API.todays_jobs():
+                if job_matches_trailer(job, trailer_code, trailer_id):
+                    s = extract_job_summary(job)
+                    context.user_data["job_summary"] = s
+                    context.user_data["suggested_port"] = suggested_port_from_job(job)
+                    if s.get("collection"):
+                        context.user_data["collection"] = s["collection"]
+                    lines = [f"*Found your job in Move IT:*\n"]
+                    if s.get("customer"):
+                        lines.append(f"Customer: {s['customer']}")
+                    if s.get("collection"):
+                        lines.append(f"Collection: {s['collection']}")
+                    if s.get("delivery"):
+                        lines.append(f"Delivery: {s['delivery']}")
+                    lines.append("\nIs this your load?")
+                    await update.message.reply_text(
+                        "\n".join(lines),
+                        parse_mode="Markdown",
+                        reply_markup=build_keyboard(["Yes, that's my load", "No - enter details myself"], cols=1),
+                    )
+                    return JOB_CONFIRM
 
     # --- Fallback: manual v3 flow ---
     names = list(QUICK_POINTS.keys())
     hint = "\n\nOr *type a few letters* to search all locations." if ADDRESS_BOOK else ""
     await update.message.reply_text(
-        f"Trailer *{md(trailer_code)}* noted.\n\nWhere did you *collect the load*? Tap one:{hint}",
+        f"Trailer *{trailer_code}* noted.\n\nWhere did you *collect the load*? Tap one:{hint}",
         parse_mode="Markdown",
         reply_markup=build_keyboard(names, cols=2, extra_row=["Other location"]),
     )
@@ -1183,19 +805,36 @@ async def get_trailer(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def job_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if "yes" in update.message.text.lower():
-        # Collection known from job. Derive country from job if possible, else ask.
         s = context.user_data.get("job_summary", {})
-        # The collect stop's address country is the most reliable source
-        cc = (s.get("collection_country") or "").strip()
-        mapped = match_country(cc) if cc else None
-        if not mapped:
-            from_c = (s.get("from_c") or "").strip()
-            mapped = match_country(from_c) if from_c and from_c.upper() != "EU" else None
+
+        # Job matched but no collection stop identified - we still need to ask where they loaded.
+        if not context.user_data.get("collection"):
+            names = list(QUICK_POINTS.keys())
+            await update.message.reply_text(
+                "Great. Where did you *collect the load*? Tap one:",
+                parse_mode="Markdown",
+                reply_markup=build_keyboard(names, cols=2, extra_row=["Other location"]),
+            )
+            return COLLECTION
+
+        # Collection known from the job -> skip that question.
+        # Derive country from the job too if possible (skips a second question).
+        from_c = (s.get("from_c") or "").strip()
+        mapped = match_country_loose(from_c) if from_c else None
+        if from_c.upper() == "EU":
+            mapped = None  # corridor-level, need real country for customs rules
         if mapped:
             context.user_data["country"] = mapped
-            return await ask_port(update, context)
+            # No live position and no coords yet? Geocode the collection so ETA still works.
+            if context.user_data.get("live_lat") is None and context.user_data.get("col_lat") is None:
+                lat, lon = geocode(context.user_data["collection"], mapped)
+                context.user_data["col_lat"], context.user_data["col_lon"] = lat, lon
+            return await offer_port(update, context)
         return await ask_country(update, context)
-    # Driver says the job is wrong - manual flow
+
+    # Driver says the job is wrong - drop everything derived from it and go manual.
+    for k in ("job_summary", "suggested_port", "collection", "col_lat", "col_lon", "country"):
+        context.user_data.pop(k, None)
     names = list(QUICK_POINTS.keys())
     await update.message.reply_text(
         "No problem. Where did you *collect the load*? Tap one:",
@@ -1253,7 +892,7 @@ async def get_collection(update: Update, context: ContextTypes.DEFAULT_TYPE):
             m[label] = loc
         context.user_data["search_matches"] = m
         await update.message.reply_text(
-            f"Found these for *{md(choice)}* - tap one:",
+            f"Found these for *{choice}* - tap one:",
             parse_mode="Markdown",
             reply_markup=build_keyboard(labels, cols=1, extra_row=["None of these - use what I typed"]),
         )
@@ -1279,7 +918,34 @@ async def get_country(update: Update, context: ContextTypes.DEFAULT_TYPE):
         lat, lon = geocode(context.user_data.get("collection", ""), context.user_data["country"])
         context.user_data["col_lat"] = lat
         context.user_data["col_lon"] = lon
+    # Matched-job flow -> one-tap port confirm when we have a suggestion; manual -> full list.
+    if context.user_data.get("job_summary"):
+        return await offer_port(update, context)
     return await ask_port(update, context)
+
+
+async def offer_port(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Matched-job path: if we could guess the departure port from the job's
+    ferry data, offer a one-tap confirm with a 'Different port' fallback for
+    reroutes. No guess -> normal port keyboard."""
+    suggested = context.user_data.get("suggested_port")
+    if suggested and suggested in PORTS:
+        await update.message.reply_text(
+            f"Looks like you're heading to *{suggested}*.\n\nConfirm, or pick a different port:",
+            parse_mode="Markdown",
+            reply_markup=build_keyboard([f"Yes - {suggested}", "Different port"], cols=1),
+        )
+        return PORT_CONFIRM
+    return await ask_port(update, context)
+
+
+async def port_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = update.message.text.strip()
+    if "different" in text.lower():
+        return await ask_port(update, context)
+    suggested = context.user_data.get("suggested_port")
+    context.user_data["port"] = suggested or match_port(text) or text
+    return await proceed_after_port(update, context)
 
 
 async def ask_port(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1296,195 +962,86 @@ async def ask_port(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def get_port(update: Update, context: ContextTypes.DEFAULT_TYPE):
     typed = update.message.text.strip()
     context.user_data["port"] = match_port(typed) or typed
+    return await proceed_after_port(update, context)
+
+
+async def proceed_after_port(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data["chat_id"] = update.effective_chat.id
 
     country = context.user_data.get("country", "")
     needs = customs_needed(country, context.user_data["port"])
     context.user_data["needs_customs"] = needs
-    # PBN checks happen at the port (channel opens ~30 min pre-arrival),
-    # so we don't ask mid-flow - just remember the route needs one.
-    context.user_data["pbn_route"] = pbn_required(country, context.user_data["port"], needs)
-    return await ask_docs(update, context)
 
-
-async def ask_docs(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Single combined step: all paperwork + notes in one go."""
-    if not context.user_data.get("needs_customs", True):
+    if not needs:
         await update.message.reply_text(
             "*No customs needed for this route!* You're good to go.\n\n"
-            "Send anything for the team anyway, or just tap *Done*.",
+            "I'll log it with the team. Any documents to attach anyway? Send them or tap Skip.",
             parse_mode="Markdown",
-            reply_markup=build_keyboard(["Done"], cols=1),
+            reply_markup=build_keyboard(["Skip"], cols=1),
+        )
+    elif cmr_required(country):
+        await update.message.reply_text(
+            "*Please send a photo of the CMR now.*\n\n"
+            "The customs team needs it to prepare your paperwork. "
+            "Also send any supplier documents you were given.",
+            parse_mode="Markdown",
+            reply_markup=build_keyboard(["I don't have the CMR"], cols=1),
         )
     else:
         await update.message.reply_text(
-            "*Send your paperwork now* - CMR, MRN, or any documents from loading. "
-            "Photos are fine.\n\n"
-            "You can also type a note for the customs team. Tap *Done* when finished.",
+            "Do you have any *MRN documents or photos* from the collection point?\n\nSend them now or tap Skip.",
             parse_mode="Markdown",
-            reply_markup=build_keyboard(["Done", "I have no documents"], cols=1),
+            reply_markup=build_keyboard(["Skip"], cols=1),
         )
     return DOCS
-
-
-
-
-async def get_pbn(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Standalone PBN channel check, reached from the persistent 'Check PBN channel'
-    button - typically used by the driver at port check-in."""
-    text = (update.message.text or "").strip()
-    d = context.user_data
-    last = d.get("last") or {}
-    kb = post_submission_kb(last.get("pbn_route", True))
-
-    def alert_data(extra=None):
-        snap = dict(last)
-        snap.update(extra or {})
-        return snap
-
-    if text.lower() == "cancel":
-        await update.message.reply_text("OK.", reply_markup=kb)
-        return ConversationHandler.END
-
-    if text.lower() == "i don't have a pbn":
-        post_pbn_alert(alert_data({"pbn": None}), "missing")
-        await update.message.reply_text(
-            "*You can't board without a PBN* - I've alerted the customs team now. "
-            "They'll create one and send it to you here. *Don't check in* until you have it.",
-            parse_mode="Markdown", reply_markup=kb)
-        return ConversationHandler.END
-
-    pbn = re.sub(r"[\s\-]", "", text).upper()
-    if pbn.startswith("PBN") and len(pbn) > 9:
-        pbn = pbn[3:]  # driver typed the word PBN before the ID
-    if not re.fullmatch(r"[A-Z0-9]{6,15}", pbn) or not any(ch.isdigit() for ch in pbn):
-        await update.message.reply_text(
-            "That doesn't look like a PBN ID. It's usually *8 letters and numbers* "
-            "(e.g. YL22UY97) - you'll find it on your booking.\n\nTry again, or tap below.",
-            parse_mode="Markdown",
-            reply_markup=build_keyboard(["I don't have a PBN", "Cancel"], cols=1),
-        )
-        return PBN
-
-    status, detail = check_pbn_status(pbn)
-    if status == "green":
-        await update.message.reply_text(
-            f"🟢 *{md(detail) if detail else 'Green channel'}* - you're good to sail. Safe drive!",
-            parse_mode="Markdown", reply_markup=kb)
-        return ConversationHandler.END
-    if status in ("red", "orange"):
-        post_pbn_alert(alert_data({"pbn": pbn}), status)
-        await update.message.reply_text(
-            f"🔴 *{md(detail) if detail else status.upper() + ' channel'}* - "
-            "a check is required at the port.\n\n"
-            "I've alerted the customs team. Follow the port signs; they'll message you here.",
-            parse_mode="Markdown", reply_markup=kb)
-        return ConversationHandler.END
-    if status == "pending" and getattr(context, "job_queue", None):
-        context.job_queue.run_repeating(
-            pbn_recheck_job, interval=600, first=600,
-            data={"pbn": pbn, "chat_id": update.effective_chat.id,
-                  "attempts": 0, "snapshot": alert_data({"pbn": pbn})},
-            name=f"pbn-{update.effective_chat.id}",
-        )
-        await update.message.reply_text(
-            f"PBN *{md(pbn)}* noted - the channel isn't decided yet (it opens about "
-            "*30 minutes before arrival*). I'll keep checking every 10 minutes and "
-            "message you the moment it changes.",
-            parse_mode="Markdown", reply_markup=kb)
-        return ConversationHandler.END
-
-    await update.message.reply_text(
-        f"I couldn't check PBN *{md(pbn)}* automatically right now"
-        f"{' (' + md(detail) + ')' if detail else ''}.\n\n"
-        f"Check it here and follow what it says:\n{PBN_LOOKUP_PAGE}\n\n"
-        "If it shows *Call to Customs*, tap *Message the team* below to let them know.",
-        parse_mode="Markdown", reply_markup=kb)
-    return ConversationHandler.END
-
-
-async def pbn_recheck_job(context: ContextTypes.DEFAULT_TYPE):
-    data = context.job.data
-    status, _ = check_pbn_status(data["pbn"])
-    if status == "green":
-        await context.bot.send_message(
-            data["chat_id"],
-            "🟢 *Your PBN just went GREEN* - you're good to sail. Safe drive!",
-            parse_mode="Markdown")
-        context.job.schedule_removal()
-        return
-    if status in ("red", "orange"):
-        snap = dict(data["snapshot"])
-        snap["pbn_status"] = status
-        post_pbn_alert(snap, status)
-        await context.bot.send_message(
-            data["chat_id"],
-            f"🔴 *Your PBN channel is {status.upper()}* - a customs check is required at the port. "
-            "The customs team has been alerted and will message you here.",
-            parse_mode="Markdown")
-        context.job.schedule_removal()
-        return
-    data["attempts"] += 1
-    if data["attempts"] >= 12:  # ~2 hours
-        await context.bot.send_message(
-            data["chat_id"],
-            f"I couldn't get a channel decision for your PBN after 2 hours. "
-            f"Please check it yourself before the port:\n{PBN_LOOKUP_PAGE}")
-        context.job.schedule_removal()
 
 
 async def get_docs(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Accumulates photos, documents, and typed notes until the driver taps Done."""
-    d = context.user_data
-    msg = update.message
-    text = (msg.text or "").strip()
-    low = text.lower()
-
-    if low in ("done", "skip"):
-        return await show_summary(update, context)
-
-    if low in ("i have no documents", "i don't have the cmr"):
-        d["cmr_missing"] = True
-        await msg.reply_text(
-            "Noted - the team will follow up on the CMR.\n\n"
-            "Anything else? Send it, type a note, or tap *Done*.",
-            parse_mode="Markdown", reply_markup=build_keyboard(["Done"], cols=1))
-        return DOCS
-
-    if msg.photo or msg.document:
-        name = (msg.document.file_name if msg.document else None) or "Photo"
+    text = (update.message.text or "").strip().lower()
+    if text == "skip":
+        context.user_data["docs"] = "None"
+        context.user_data["doc_url"] = None
+    elif text == "i don't have the cmr":
+        context.user_data["docs"] = "CMR NOT PROVIDED"
+        context.user_data["doc_url"] = None
+        context.user_data["cmr_missing"] = True
+    elif update.message.photo:
         try:
-            f = await (msg.document.get_file() if msg.document else msg.photo[-1].get_file())
-            d.setdefault("doc_urls", []).append(f.file_path)
+            file = await update.message.photo[-1].get_file()
+            context.user_data["doc_url"] = file.file_path
+            context.user_data["docs"] = "Photo uploaded"
         except Exception as e:
             print(f"File fetch error: {e}")
-            name += " (link unavailable)"
-        d.setdefault("doc_names", []).append(name)
-        await msg.reply_text(
-            f"Got it ({len(d['doc_names'])}) - send more, type a note, or tap *Done*.",
-            parse_mode="Markdown", reply_markup=build_keyboard(["Done"], cols=1))
-        return DOCS
-
-    if text:
-        d["notes"] = f"{d['notes']}\n{text}" if d.get("notes") else text
-        await msg.reply_text(
-            "Noted - anything else? Tap *Done* when finished.",
-            parse_mode="Markdown", reply_markup=build_keyboard(["Done"], cols=1))
-    return DOCS
-
-
-async def show_summary(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    d = context.user_data
-    names = d.get("doc_names") or []
-    if names:
-        d["docs"] = ", ".join(names) + (" | CMR NOT PROVIDED" if d.get("cmr_missing") else "")
+            context.user_data["doc_url"] = None
+            context.user_data["docs"] = "Photo uploaded (link unavailable)"
+    elif update.message.document:
+        try:
+            file = await update.message.document.get_file()
+            context.user_data["doc_url"] = file.file_path
+            context.user_data["docs"] = update.message.document.file_name
+        except Exception as e:
+            print(f"File fetch error: {e}")
+            context.user_data["doc_url"] = None
+            context.user_data["docs"] = f"{update.message.document.file_name} (link unavailable)"
     else:
-        d["docs"] = "CMR NOT PROVIDED" if d.get("cmr_missing") else "None"
-    d["doc_url"] = (d.get("doc_urls") or [None])[0]
-    d.setdefault("notes", "None")
+        context.user_data["docs"] = update.message.text or "None"
+        context.user_data["doc_url"] = None
+
+    await update.message.reply_text(
+        "Any *additional notes* for the customs team?\n\nType them or tap Skip.",
+        parse_mode="Markdown",
+        reply_markup=build_keyboard(["Skip"], cols=1),
+    )
+    return NOTES
+
+
+async def get_notes(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = update.message.text.strip()
+    context.user_data["notes"] = "None" if text.lower() == "skip" else text
 
     compute_route(context)
 
+    d = context.user_data
     if not d.get("needs_customs", True):
         status_line = "\nNo customs needed - good to go\n"
     elif d.get("cmr_missing"):
@@ -1492,23 +1049,22 @@ async def show_summary(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         status_line = ""
     job = d.get("job_summary") or {}
-    job_line = f"Job: {md(job['job_id'])}\n" if job.get("job_id") else ""
+    job_line = f"Job: {job['job_id']}\n" if job.get("job_id") else ""
     summary = (
         f"*Please check your summary:*\n{status_line}\n"
         f"{job_line}"
-        f"Trailer: *{md(d.get('trailer'))}*\n"
-        f"Collection: {md(d.get('collection'))} ({md(d.get('country'))})\n"
-        f"Port: {md(d.get('port'))}\n"
-        f"Distance: {md(d.get('dist_str'))}\n"
-        f"Docs: {md(d.get('docs'))}\n"
-        f"Notes: {md(d.get('notes'))}"
+        f"Trailer: *{d.get('trailer')}*\n"
+        f"Collection: {d.get('collection')} ({d.get('country')})\n"
+        f"Port: {d.get('port')}\n"
+        f"Distance: {d.get('dist_str')}\n"
+        f"Docs: {d.get('docs')}\n"
+        f"Notes: {d.get('notes')}"
     )
-    kb = build_keyboard(["Send to customs team", "Start again"], cols=1)
-    try:
-        await update.message.reply_text(summary, parse_mode="Markdown", reply_markup=kb)
-    except Exception as e:
-        print(f"Summary Markdown send failed ({e}) - retrying as plain text")
-        await update.message.reply_text(summary.replace("\\", "").replace("*", ""), reply_markup=kb)
+    await update.message.reply_text(
+        summary,
+        parse_mode="Markdown",
+        reply_markup=build_keyboard(["Send to customs team", "Start again"], cols=1),
+    )
     return CONFIRM
 
 
@@ -1516,32 +1072,20 @@ async def confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if "start again" in update.message.text.lower():
         return await start(update, context)
 
-    d = context.user_data
-    d["submitted"] = datetime.now().strftime("%d/%m %H:%M")
-    success = post_to_teams(d)
-    pbn_route = d.get("pbn_route", False)
-    kb = post_submission_kb(pbn_route)
+    context.user_data["submitted"] = datetime.now().strftime("%d/%m %H:%M")
+    success = post_to_teams(context.user_data)
     if success:
-        if not d.get("needs_customs", True):
+        if not context.user_data.get("needs_customs", True):
             msg = "*Logged with the team.*\n\nNo customs needed - you're good to go!\n\nSafe drive!"
         else:
             msg = "*Customs team notified!*\n\nThey'll prepare your paperwork and message you here if anything is needed.\n\nSafe drive!"
-        if pbn_route:
-            msg += ("\n\n🚢 *At port check-in*, tap *Check PBN channel* below "
-                    "and I'll tell you your boarding channel.")
-        await update.message.reply_text(msg, parse_mode="Markdown", reply_markup=kb)
+        await update.message.reply_text(msg, parse_mode="Markdown", reply_markup=ReplyKeyboardRemove())
     else:
         await update.message.reply_text(
             "Something went wrong sending to Teams. Please call the customs team directly.",
-            reply_markup=kb,
+            reply_markup=ReplyKeyboardRemove(),
         )
-    # Keep a small snapshot so PBN checks and team messages have context afterwards
-    last = {"trailer": d.get("trailer"), "port": d.get("port"),
-            "collection": d.get("collection"), "country": d.get("country"),
-            "live_text": d.get("live_text"), "pbn_route": pbn_route,
-            "chat_id": d.get("chat_id")}
     context.user_data.clear()
-    context.user_data["last"] = last
     return ConversationHandler.END
 
 
@@ -1551,31 +1095,12 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return ConversationHandler.END
 
 
-
-
-
-
-
-
-
-
-def refresh_datasets():
-    """Slow: pulls up to 90 days of job history (with per-day retries around Move IT's
-    null-date 500s). Runs in a background thread so the bot answers drivers immediately;
-    fallback quick points / full port list serve until this finishes."""
-    try:
-        history = API.job_history() if API.enabled else []
-        build_frequent_collection_points(jobs=history)
-        print("[datasets] background refresh complete")
-    except Exception as e:
-        print(f"[datasets] background refresh failed: {e} - fallback lists remain active")
-
-
 def main():
     load_address_book()
-    load_ports_from_api()  # fast: single call, worth doing before polling starts
-    threading.Thread(target=refresh_datasets, daemon=True).start()
-    threading.Thread(target=assignments_loop, daemon=True).start()
+    load_ports_from_api()
+    history = API.job_history() if API.enabled else []
+    build_frequent_collection_points(jobs=history)
+    rank_ports_by_usage(history)
     print(f"Move IT API: {'ENABLED at ' + MOVEIT_BASE_URL if API.enabled else 'not configured - manual flow only'}")
     app = Application.builder().token(BOT_TOKEN).build()
     conv = ConversationHandler(
@@ -1586,15 +1111,15 @@ def main():
             COLLECTION:  [MessageHandler(filters.TEXT & ~filters.COMMAND, get_collection)],
             COUNTRY:     [MessageHandler(filters.TEXT & ~filters.COMMAND, get_country)],
             PORT:        [MessageHandler(filters.TEXT & ~filters.COMMAND, get_port)],
-            PBN:         [MessageHandler(filters.TEXT & ~filters.COMMAND, get_pbn)],
+            PORT_CONFIRM: [MessageHandler(filters.TEXT & ~filters.COMMAND, port_confirm)],
             DOCS:        [MessageHandler(filters.TEXT | filters.PHOTO | filters.Document.ALL, get_docs)],
+            NOTES:       [MessageHandler(filters.TEXT & ~filters.COMMAND, get_notes)],
             CONFIRM:     [MessageHandler(filters.TEXT & ~filters.COMMAND, confirm)],
-            RELAY:       [MessageHandler(filters.TEXT & ~filters.COMMAND, relay_to_team)],
         },
         fallbacks=[CommandHandler("cancel", cancel)],
     )
     app.add_handler(conv)
-    print("Bot v7 is running...")
+    print("Bot v4 is running...")
     app.run_polling()
 
 
