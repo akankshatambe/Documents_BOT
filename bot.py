@@ -1,8 +1,7 @@
 import os
 import csv
 import requests
-from datetime import datetime, date, timedelta
-import time
+from datetime import datetime, date
 from telegram import Update, ReplyKeyboardMarkup, ReplyKeyboardRemove
 from telegram.ext import (
     Application,
@@ -45,11 +44,11 @@ class MoveItAPI:
             self.session.auth = (MOVEIT_API_KEY, MOVEIT_API_PASSWORD)
         self.session.headers.update({"Accept": "application/json"})
 
-    def _get(self, path, params=None, timeout=10):
+    def _get(self, path, params=None):
         if not self.enabled:
             return None
         try:
-            r = self.session.get(f"{MOVEIT_BASE_URL}/{path.lstrip('/')}", params=params, timeout=timeout)
+            r = self.session.get(f"{MOVEIT_BASE_URL}/{path.lstrip('/')}", params=params, timeout=10)
             print(f"MoveIT API {path} -> {r.status_code}: {r.text[:300]}")
             if r.status_code == 200:
                 return r.json()
@@ -69,49 +68,6 @@ class MoveItAPI:
         today = date.today().strftime("%Y-%m-%d")
         data = self._get("job", params={"fromdate": today, "todate": today})
         return data if isinstance(data, list) else []
-
-    def job_history(self, days=90, chunk_days=7):
-        """Pull job history in small windows. Move IT's job endpoint 500s
-        ('DBNull to Date') if any job in the requested range has a null date,
-        so failed chunks are retried day-by-day and only the poisoned days skipped."""
-        all_jobs, seen_ids = [], set()
-        bad_days = 0
-        end = date.today()
-        cur = end - timedelta(days=days)
-
-        def _collect(data):
-            nonlocal all_jobs
-            for j in data:
-                jid = _find_key(j, "id", "jobid")
-                if jid is None or jid not in seen_ids:
-                    if jid is not None:
-                        seen_ids.add(jid)
-                    all_jobs.append(j)
-
-        while cur <= end:
-            chunk_end = min(cur + timedelta(days=chunk_days - 1), end)
-            data = self._get("job", params={
-                "fromdate": cur.strftime("%Y-%m-%d"),
-                "todate": chunk_end.strftime("%Y-%m-%d"),
-            }, timeout=30)
-            if isinstance(data, list):
-                _collect(data)
-            else:
-                # Chunk failed (likely a null-date job) - retry each day, skip the bad ones.
-                d = cur
-                while d <= chunk_end:
-                    ds = d.strftime("%Y-%m-%d")
-                    daily = self._get("job", params={"fromdate": ds, "todate": ds}, timeout=30)
-                    if isinstance(daily, list):
-                        _collect(daily)
-                    else:
-                        bad_days += 1
-                    d += timedelta(days=1)
-            cur = chunk_end + timedelta(days=1)
-
-        if bad_days:
-            print(f"[job-history] skipped {bad_days} day(s) that Move IT could not serve (null-date records)")
-        return all_jobs
 
     def ferry_ports(self):
         data = self._get("ferryport")
@@ -144,73 +100,183 @@ def _as_text(value):
     return str(value)
 
 
-def _stop_action_text(stop):
-    return _norm(_as_text(_find_key(stop, "stopaction", "action")) or "")
+# =====================================================================
+# JOB PARSING - trailer + collection/delivery live inside the stops array
+# ---------------------------------------------------------------------
+# A Move IT job looks like:
+#   {"id":1532335,
+#    "customer":{"id":328,"code":"GLO001","name":"Global Fruit Company Ltd."},
+#    "stops":[{"id":..,"jobid":..,"groupid":..,
+#              "stopdatetime":"2026-07-15T11:00:00",
+#              "stopaction":{"id":13,"code":"Drop Trailer"},
+#              "address":{"id":115,"code":"Global Fruit-finglas","name":"Global Fruit",...}}]}
+# The trailer is NOT a documented top-level field, so job_matches_trailer()
+# walks the ENTIRE structure (top level + every stop) looking for the code
+# anywhere, or the trailer id inside a trailer-ish subtree.
+# Which stop is collection vs delivery is decided from the stopaction code,
+# with a positional fallback (first stop = collection, last = delivery) for
+# codes we don't yet recognise. Adjust the keyword lists below once the real
+# stopaction code set is confirmed from the live logs.
+# =====================================================================
+
+# stopaction.code keywords -> role. Matched as substrings of the normalised code.
+STOP_COLLECT_KEYWORDS = ("collect", "load", "pick")
+STOP_DELIVER_KEYWORDS = ("deliver", "unload", "drop", "tip", "offload")
+
+# keys whose subtree may hold a trailer id we can match on
+_TRAILERISH_KEYS = ("trailer", "trailercode", "trailerreg", "registration",
+                    "reg", "vehicle", "equipment", "resource", "asset", "unit")
 
 
-def _stop_trailer_ref(stop):
-    """A stop may carry its trailer reference under several possible keys."""
-    t = _find_key(stop, "trailer", "starttrailer", "finishtrailer", "trailercode")
-    if t is None:
-        return None
-    if isinstance(t, dict):
-        return str(_find_key(t, "code", "registration") or ""), _find_key(t, "id")
-    return str(t), None
+def _stop_action_code(stop):
+    action = _find_key(stop, "stopaction", "action", "activity")
+    if isinstance(action, dict):
+        return str(_find_key(action, "code", "name", "description") or "")
+    return str(action or "")
+
+
+def _stop_address_dict(stop):
+    addr = _find_key(stop, "address", "location", "site")
+    return addr if isinstance(addr, dict) else None
+
+
+def _stop_address_text(stop):
+    addr = _stop_address_dict(stop)
+    if addr:
+        name = _find_key(addr, "name")
+        city = _find_key(addr, "city", "town")
+        parts = [str(p) for p in (name, city) if p]
+        if parts:
+            # avoid "Global Fruit, Global Fruit" style duplicates
+            if len(parts) == 2 and _norm(parts[1]) in _norm(parts[0]):
+                return parts[0]
+            return ", ".join(parts)
+        code = _find_key(addr, "code")
+        return str(code) if code else None
+    return _as_text(_find_key(stop, "address", "location", "site"))
+
+
+def _stop_country(stop):
+    addr = _stop_address_dict(stop)
+    if addr:
+        return _as_text(_find_key(addr, "country", "countryname", "country_name", "countrycode"))
+    return None
+
+
+def _stop_when(stop):
+    return str(_find_key(stop, "stopdatetime", "datetime", "date", "eta", "plannedarrival") or "")
+
+
+def _classify_stop(stop):
+    c = _norm(_stop_action_code(stop))
+    if any(k in c for k in STOP_COLLECT_KEYWORDS):
+        return "collect"
+    if any(k in c for k in STOP_DELIVER_KEYWORDS):
+        return "deliver"
+    return "other"
+
+
+def _job_stops(job):
+    stops = _find_key(job, "stops", "stop", "legs", "movements")
+    if not isinstance(stops, list):
+        return []
+    stops = [s for s in stops if isinstance(s, dict)]
+    # ISO datetimes sort correctly as plain strings; stable sort keeps API order on ties
+    return sorted(stops, key=_stop_when)
 
 
 def extract_job_summary(job):
-    """Pull the useful fields out of a job record by walking its stops."""
-    stops = _find_key(job, "stops") or []
-    stops = sorted(stops, key=lambda s: _find_key(s, "stopdatetime") or "")
+    """Pull the useful fields out of a job record - trailer/collection/delivery
+    live inside the stops array, not at the top level."""
+    stops = _job_stops(job)
 
-    collection_stop = next((s for s in stops if "collect" in _stop_action_text(s)), None)
-    # "Drop Trailer" / "Deliver" style actions mark the delivery stop -
-    # exclude any "collect" match so we don't double count.
-    delivery_stop = next(
-        (s for s in stops if ("drop" in _stop_action_text(s) or "deliver" in _stop_action_text(s))
-         and "collect" not in _stop_action_text(s)),
-        None,
-    )
+    collect_stop = None
+    deliver_stop = None
+    for s in stops:
+        role = _classify_stop(s)
+        if role == "collect" and collect_stop is None:
+            collect_stop = s
+        elif role == "deliver":
+            deliver_stop = s  # last delivery wins (final drop)
+
+    # Positional fallback for codes we don't recognise yet.
+    if collect_stop is None and stops:
+        collect_stop = stops[0]
+    if deliver_stop is None and len(stops) > 1:
+        deliver_stop = stops[-1]
+
+    # Never report the same physical stop as both collection and delivery
+    # (e.g. a single "Drop Trailer" stop -> collection only, no delivery).
+    if deliver_stop is collect_stop:
+        deliver_stop = None
 
     return {
         "job_id": _find_key(job, "id", "jobid", "job #", "job_no", "jobnumber"),
         "customer": _as_text(_find_key(job, "customer", "customer name", "client")),
-        "collection": _as_text(_find_key(collection_stop, "address")) if collection_stop else None,
-        "delivery": _as_text(_find_key(delivery_stop, "address")) if delivery_stop else None,
-        "collection_time": _find_key(collection_stop, "stopdatetime") if collection_stop else None,
-        "delivery_time": _find_key(delivery_stop, "stopdatetime") if delivery_stop else None,
-        "from_c": _as_text(_find_key(job, "from", "fromcountry", "origin")),
-        "to_c": _as_text(_find_key(job, "to", "tocountry", "destination")),
+        "collection": _stop_address_text(collect_stop) if collect_stop else None,
+        "delivery": _stop_address_text(deliver_stop) if deliver_stop else None,
+        "from_c": _stop_country(collect_stop) if collect_stop else None,
+        "to_c": _stop_country(deliver_stop) if deliver_stop else None,
         "ferry": _as_text(_find_key(job, "ferrybooking", "ferry", "crossing")),
     }
 
 
 def job_matches_trailer(job, trailer_code, trailer_id):
-    """Does this job reference our trailer? Checks the job itself, then walks its stops."""
-    trailer_code = (trailer_code or "").upper()
+    """Does this job reference our trailer? The trailer isn't a fixed top-level
+    field, so walk the whole job (incl. every stop): match the code anywhere,
+    or the id when it sits inside a trailer-ish subtree (avoids colliding with
+    the many other ids in a job - stop ids, address ids, customer id, etc.)."""
+    code_norm = _norm(trailer_code) if trailer_code else ""
+    hit = {"found": False}
 
-    def _matches(code, tid):
-        return (code or "").upper() == trailer_code or (trailer_id is not None and tid == trailer_id)
+    def walk(node, in_trailer_ctx):
+        if hit["found"]:
+            return
+        if isinstance(node, dict):
+            for k, v in node.items():
+                child_ctx = in_trailer_ctx or any(t in _norm(k) for t in _TRAILERISH_KEYS)
+                walk(v, child_ctx)
+        elif isinstance(node, list):
+            for v in node:
+                walk(v, in_trailer_ctx)
+        elif node is not None:
+            if code_norm and _norm(node) == code_norm:
+                hit["found"] = True
+                return
+            if trailer_id is not None and in_trailer_ctx:
+                try:
+                    if int(node) == int(trailer_id):
+                        hit["found"] = True
+                except (ValueError, TypeError):
+                    pass
 
-    # Some job payloads may still carry the trailer at top level - keep this as a fallback.
-    t = _find_key(job, "trailer", "starttrailer", "finishtrailer", "trailercode")
-    if t is not None:
-        if isinstance(t, dict):
-            if _matches(_find_key(t, "code", "registration"), _find_key(t, "id")):
-                return True
-        elif trailer_code in str(t).upper():
-            return True
-
-    # Per the live API, the trailer reference actually lives inside each stop.
-    for stop in _find_key(job, "stops") or []:
-        code, tid = _stop_trailer_ref(stop) or (None, None)
-        if code is not None and _matches(code, tid):
-            return True
-
-    return False
+    walk(job, False)
+    return hit["found"]
 
 
-FALLBACK_QUICK_POINTS = {
+def suggested_port_from_job(job, summary):
+    """Best-effort: pull a likely departure port from ferry/route fields on the
+    job so we can offer a one-tap confirm. Returns a PORTS key or None.
+    Only looks at explicit ferry/route/port fields (not addresses) to avoid
+    false matches. Improve once the ferry JSON shape is confirmed."""
+    def port_in(text):
+        if not text:
+            return None
+        tl = str(text).lower()
+        for p in PORTS:
+            if p.lower() in tl:
+                return p
+        return None
+
+    for key in ("departureport", "departure_port", "ferryport", "port",
+                "route", "crossing", "ferry", "ferrybooking", "sailing"):
+        p = port_in(_as_text(_find_key(job, key)))
+        if p:
+            return p
+    return port_in(summary.get("ferry"))
+
+
+QUICK_POINTS = {
     "ABP Cahir":            ("Cahir", "Ireland", 52.3775, -7.9268),
     "G's Fresh Barway":     ("Barway, Ely", "UK", 52.3480, 0.2735),
     "Florette Lichfield":   ("Lichfield", "UK", 52.6816, -1.8317),
@@ -221,8 +287,6 @@ FALLBACK_QUICK_POINTS = {
     "RDV Marck":            ("Marck", "France", 50.9490, 1.9520),
 }
 
-QUICK_POINTS = dict(FALLBACK_QUICK_POINTS)
-
 ADDRESS_BOOK = []
 
 def load_address_book():
@@ -230,11 +294,9 @@ def load_address_book():
     if not os.path.exists(path):
         print("No locations.csv found - running with quick buttons only")
         return
-    for enc in ("utf-8-sig", "cp1252", "latin-1"):
-        try:
-            with open(path, newline="", encoding=enc) as f:
-                rows = list(csv.DictReader(f))
-            for row in rows:
+    try:
+        with open(path, newline="", encoding="utf-8-sig") as f:
+            for row in csv.DictReader(f):
                 name = (row.get("Name") or "").strip()
                 if name:
                     ADDRESS_BOOK.append({
@@ -242,14 +304,9 @@ def load_address_book():
                         "city": (row.get("City") or "").strip(),
                         "country": (row.get("Country") or "").strip(),
                     })
-            print(f"Loaded {len(ADDRESS_BOOK)} locations from locations.csv (encoding: {enc})")
-            return
-        except UnicodeDecodeError:
-            continue
-        except Exception as e:
-            print(f"Could not load locations.csv: {e}")
-            return
-    print("Could not load locations.csv: unknown text encoding")
+        print(f"Loaded {len(ADDRESS_BOOK)} locations from locations.csv")
+    except Exception as e:
+        print(f"Could not load locations.csv: {e}")
 
 
 def search_locations(query, limit=8):
@@ -268,7 +325,7 @@ def search_locations(query, limit=8):
     return (starts + contains)[:limit]
 
 
-FALLBACK_PORTS = {
+PORTS = {
     "Dublin Port":  (53.3456, -6.2045),
     "Rosslare":     (52.2519, -6.3387),
     "Holyhead":     (53.3090, -4.6329),
@@ -284,147 +341,29 @@ FALLBACK_PORTS = {
     "Belfast":      (54.6079, -5.9264),
 }
 
-PORTS = dict(FALLBACK_PORTS)
-
 EU_COUNTRIES = {"ireland", "france", "germany", "netherlands", "belgium", "spain", "italy", "poland"}
 NI_PORTS = {"Larne", "Belfast"}
 DIRECT_EU_PORTS = {"Cherbourg"}
 COUNTRY_OPTIONS = ["UK", "Northern Ireland", "Ireland", "France", "Germany",
                    "Netherlands", "Belgium", "Spain", "Italy", "Poland", "Other"]
 
+# Map free-text country values from Move IT (GB, IE, "United Kingdom", ...) to our options.
+COUNTRY_ALIASES = {
+    "gb": "UK", "uk": "UK", "united kingdom": "UK", "great britain": "UK",
+    "england": "UK", "scotland": "UK", "wales": "UK", "gbr": "UK",
+    "ni": "Northern Ireland", "northern ireland": "Northern Ireland", "xi": "Northern Ireland",
+    "ie": "Ireland", "irl": "Ireland", "ireland": "Ireland",
+    "republic of ireland": "Ireland", "eire": "Ireland",
+    "fr": "France", "fra": "France", "france": "France",
+    "de": "Germany", "deu": "Germany", "germany": "Germany", "deutschland": "Germany",
+    "nl": "Netherlands", "nld": "Netherlands", "netherlands": "Netherlands", "holland": "Netherlands",
+    "be": "Belgium", "bel": "Belgium", "belgium": "Belgium",
+    "es": "Spain", "esp": "Spain", "spain": "Spain",
+    "it": "Italy", "ita": "Italy", "italy": "Italy",
+    "pl": "Poland", "pol": "Poland", "poland": "Poland",
+}
 
-def _resolve_named_ports(keywords):
-    """Map known keyword ports (e.g. 'Belfast') to whatever name the live API actually returned,
-    so customs logic keeps working even if Move IT's naming differs slightly (e.g. 'Belfast Terminal')."""
-    resolved = set()
-    for kw in keywords:
-        match = next((p for p in PORTS if kw.lower() in p.lower()), None)
-        resolved.add(match or kw)
-    return resolved
-
-
-def load_ports_from_api():
-    """Populate PORTS from Move IT's ferryport endpoint; falls back to the static list on any failure."""
-    global PORTS, NI_PORTS, DIRECT_EU_PORTS
-    if not API.enabled:
-        print("Move IT API disabled - using fallback ports list")
-        return
-    data = API.ferry_ports()
-    if not data:
-        print("No ferry ports returned from Move IT - using fallback ports list")
-        return
-
-    loaded = {}
-    for p in data:
-        addr = _find_key(p, "address")
-        addr = addr if isinstance(addr, dict) else {}
-        # Per the live API, the friendly name and coordinates live inside address;
-        # fall back to top-level fields just in case.
-        name = (_as_text(_find_key(addr, "name")) or _as_text(_find_key(p, "name", "portname", "code")) or "").strip()
-        lat = _find_key(addr, "lat", "latitude")
-        lon = _find_key(addr, "lon", "lng", "longitude")
-        if lat is None:
-            lat = _find_key(p, "lat", "latitude")
-        if lon is None:
-            lon = _find_key(p, "lon", "lng", "longitude")
-        if name and lat is not None and lon is not None:
-            try:
-                loaded[name] = (float(lat), float(lon))
-            except (TypeError, ValueError):
-                continue
-            # Remember every identifier this port goes by, for matching against job records.
-            addr_code = _find_key(addr, "code")
-            if addr_code:
-                PORT_ADDR_CODES[_norm(addr_code)] = name
-            for alias in (name, _find_key(p, "code"), _find_key(p, "name"),
-                          addr_code, _find_key(addr, "town")):
-                a = _norm(alias or "")
-                if len(a) >= 4:
-                    PORT_ALIASES[a] = name
-
-    if not loaded:
-        print("Ferry port data had no usable name/lat/lon - using fallback ports list")
-        return
-
-    PORTS = loaded
-    NI_PORTS = _resolve_named_ports({"Larne", "Belfast"})
-    DIRECT_EU_PORTS = _resolve_named_ports({"Cherbourg"})
-    print(f"Loaded {len(PORTS)} ports from Move IT ferryport endpoint")
-
-
-PORT_ALIASES = {}      # normalized alias -> canonical port name
-PORT_ADDR_CODES = {}   # normalized ferryport address code -> canonical port name
-TOP_PORTS = []         # most-used ports (keyboard order); empty = show all
-
-
-_FERRYISH = ("ferry", "boat", "tunnel", "crossing", "sail", "port", "checkin", "check-in")
-
-
-def rank_ports_by_usage(jobs, top_n=10):
-    """Rank ports by how often job history references them. Only trusted evidence counts:
-    the job's ferry/crossing field, an exact ferryport address-code match on a stop,
-    or a ferry/tunnel-type stop action. Plain delivery addresses in a port town don't count."""
-    global TOP_PORTS
-    if not jobs:
-        print("[port-rank] no job history - keyboard will show all ports")
-        return
-
-    aliases = dict(PORT_ALIASES)
-    for name in PORTS:  # ensure fallback-mode port names are matchable too
-        aliases.setdefault(_norm(name), name)
-
-    def _fuzzy(text):
-        n = _norm(text or "")
-        if not n:
-            return None
-        if n in aliases:
-            return aliases[n]
-        return next((pname for a, pname in aliases.items() if a in n or n in a), None)
-
-    def _fuzzy_all(text):
-        """A ferry booking like 'Dublin Port - Holyhead 22:30' names both ends - match every port in it."""
-        n = _norm(text or "")
-        if not n:
-            return set()
-        return {pname for a, pname in aliases.items() if a in n}
-
-    counts, matched_jobs = {}, 0
-    for job in jobs:
-        hits = set()
-        ferry_text = _as_text(_find_key(job, "ferrybooking", "ferry", "crossing"))
-        if ferry_text:
-            hits |= _fuzzy_all(ferry_text)
-        for stop in _find_key(job, "stops") or []:
-            addr = _find_key(stop, "address")
-            addr = addr if isinstance(addr, dict) else {}
-            code = _norm(_find_key(addr, "code") or "")
-            if code and code in PORT_ADDR_CODES:
-                hits.add(PORT_ADDR_CODES[code])
-                continue
-            action = _stop_action_text(stop)
-            if any(k in action for k in _FERRYISH):
-                hit = _fuzzy(_find_key(addr, "name")) or _fuzzy(_find_key(addr, "town")) or _fuzzy(_find_key(addr, "code"))
-                if hit:
-                    hits.add(hit)
-        if hits:
-            matched_jobs += 1
-            for p in hits:
-                counts[p] = counts.get(p, 0) + 1
-
-    if not counts:
-        print("[port-rank] no port references found in job history - keyboard will show all ports")
-        return
-
-    ranked = sorted(counts.items(), key=lambda kv: kv[1], reverse=True)
-    TOP_PORTS = [p for p, _ in ranked[:top_n]]
-    print(f"[port-rank] {matched_jobs}/{len(jobs)} jobs referenced a port; "
-          f"top {len(TOP_PORTS)}: {ranked[:top_n]}")
-
-
-def port_keyboard_names():
-    return TOP_PORTS if TOP_PORTS else list(PORTS.keys())
-
-TRAILER, JOB_CONFIRM, COLLECTION, COUNTRY, PORT, DOCS, NOTES, CONFIRM = range(8)
+TRAILER, JOB_CONFIRM, COLLECTION, COUNTRY, PORT, PORT_CONFIRM, DOCS, NOTES, CONFIRM = range(9)
 
 
 def build_keyboard(items, cols=2, extra_row=None):
@@ -444,6 +383,16 @@ def match_country(typed):
     return next((c for c in COUNTRY_OPTIONS if c.lower() == t), None)
 
 
+def match_country_loose(typed):
+    """Accepts free-text/ISO country values from Move IT and maps to a COUNTRY_OPTION."""
+    if not typed:
+        return None
+    t = str(typed).lower().strip()
+    if t in COUNTRY_ALIASES:
+        return COUNTRY_ALIASES[t]
+    return match_country(typed)
+
+
 def geocode(place, country=""):
     try:
         r = requests.get(
@@ -458,90 +407,6 @@ def geocode(place, country=""):
     except Exception as e:
         print(f"Geocode error: {e}")
     return None, None
-
-
-_GEOCODE_CACHE = {}
-
-
-def _cached_geocode(place, country=""):
-    key = f"{place}|{country}".lower()
-    if key not in _GEOCODE_CACHE:
-        _GEOCODE_CACHE[key] = geocode(place, country)
-        time.sleep(1)  # respect Nominatim's 1 req/sec usage policy
-    return _GEOCODE_CACHE[key]
-
-
-def build_frequent_collection_points(days=90, top_n=16, min_count=1, jobs=None):
-    """Walk Move IT job history and rank collection addresses by how often they're actually used,
-    replacing the static QUICK_POINTS buttons with real, current data."""
-    global QUICK_POINTS
-    if not API.enabled:
-        print("[freq-points] Move IT API disabled - using fallback quick points")
-        return
-
-    if jobs is None:
-        jobs = API.job_history(days=days)
-    print(f"[freq-points] job_history returned {len(jobs)} jobs over last {days} days")
-    if not jobs:
-        print("[freq-points] no jobs - trying shorter 30-day range in case the API limits the window")
-        jobs = API.job_history(days=30)
-        print(f"[freq-points] 30-day retry returned {len(jobs)} jobs")
-    if not jobs:
-        print("[freq-points] still no jobs - using fallback quick points")
-        return
-
-    action_codes_seen = set()
-    stops_total = 0
-    tally = {}
-    for job in jobs:
-        for stop in _find_key(job, "stops") or []:
-            stops_total += 1
-            action_codes_seen.add(_as_text(_find_key(stop, "stopaction", "action")) or "?")
-            if "collect" not in _stop_action_text(stop):
-                continue
-            addr = _find_key(stop, "address")
-            if not isinstance(addr, dict):
-                print(f"[freq-points] collect stop had no address dict, keys were: {list(stop.keys())}")
-                continue
-            code = _find_key(addr, "code")
-            name = _as_text(_find_key(addr, "name")) or code
-            if not code or not name:
-                print(f"[freq-points] address missing code/name, keys were: {list(addr.keys())}")
-                continue
-            country = _as_text(_find_key(addr, "country", "countrycode")) or ""
-            lat = _find_key(addr, "lat", "latitude")
-            lon = _find_key(addr, "lon", "lng", "longitude")
-            entry = tally.setdefault(code, {"name": name, "country": country,
-                                            "lat": lat, "lon": lon, "count": 0})
-            entry["count"] += 1
-
-    print(f"[freq-points] scanned {stops_total} stops; action codes seen: {sorted(action_codes_seen)}")
-    print(f"[freq-points] tallied {len(tally)} distinct collection addresses")
-
-    ranked = sorted(tally.values(), key=lambda e: e["count"], reverse=True)
-    ranked = [e for e in ranked if e["count"] >= min_count][:top_n]
-    if not ranked:
-        print("[freq-points] no collection stops matched - check action codes above; using fallback quick points")
-        return
-
-    built = {}
-    for e in ranked:
-        lat, lon = e.get("lat"), e.get("lon")
-        if lat is None or lon is None:
-            lat, lon = _cached_geocode(e["name"], e["country"])
-        if lat is None:
-            print(f"[freq-points] no coordinates for '{e['name']}' ({e['country'] or 'no country'}) - skipping")
-            continue
-        try:
-            built[e["name"]] = (e["name"], e["country"], float(lat), float(lon))
-        except (TypeError, ValueError):
-            continue
-
-    if built:
-        QUICK_POINTS = built
-        print(f"[freq-points] SUCCESS: loaded {len(QUICK_POINTS)} frequent collection points: {list(QUICK_POINTS)}")
-    else:
-        print("[freq-points] geocoding failed for all candidates - using fallback quick points")
 
 
 def route_info(from_lat, from_lon, to_lat, to_lon):
@@ -700,9 +565,10 @@ async def get_trailer(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 if job_matches_trailer(job, trailer_code, trailer_id):
                     s = extract_job_summary(job)
                     context.user_data["job_summary"] = s
+                    context.user_data["suggested_port"] = suggested_port_from_job(job, s)
                     if s.get("collection"):
                         context.user_data["collection"] = s["collection"]
-                    lines = [f"*Found your job in Move IT:*\n"]
+                    lines = ["*Found your job in Move IT:*\n"]
                     if s.get("customer"):
                         lines.append(f"Customer: {s['customer']}")
                     if s.get("collection"):
@@ -730,17 +596,28 @@ async def get_trailer(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def job_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if "yes" in update.message.text.lower():
-        # Collection known from job. Derive country from job if possible, else ask.
+        # Collection is known from the job. Skip the collection question.
+        # Derive country from the job if we can, otherwise ask it (customs rules need it).
         s = context.user_data.get("job_summary", {})
         from_c = (s.get("from_c") or "").strip()
-        mapped = match_country(from_c) if from_c else None
+        mapped = match_country_loose(from_c) if from_c else None
         if from_c.upper() == "EU":
-            mapped = None  # corridor-level, need real country for customs rules
+            mapped = None  # corridor-level, need the real country for customs rules
+
         if mapped:
             context.user_data["country"] = mapped
-            return await ask_port(update, context)
+            # No live position + no geocode yet? Geocode the collection so ETA still works.
+            if context.user_data.get("live_lat") is None and context.user_data.get("col_lat") is None:
+                col = context.user_data.get("collection")
+                if col:
+                    lat, lon = geocode(col, mapped)
+                    context.user_data["col_lat"], context.user_data["col_lon"] = lat, lon
+            return await offer_port(update, context)
         return await ask_country(update, context)
-    # Driver says the job is wrong - manual flow
+
+    # Driver says the job is wrong -> drop the matched job and fall back to manual.
+    for k in ("job_summary", "suggested_port", "collection", "col_lat", "col_lon", "country"):
+        context.user_data.pop(k, None)
     names = list(QUICK_POINTS.keys())
     await update.message.reply_text(
         "No problem. Where did you *collect the load*? Tap one:",
@@ -758,8 +635,6 @@ async def get_collection(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.user_data.update(
             {"collection": choice, "country": country, "col_lat": lat, "col_lon": lon}
         )
-        if not country:
-            return await ask_country(update, context)
         return await ask_port(update, context)
 
     if choice == "Other location":
@@ -824,16 +699,40 @@ async def get_country(update: Update, context: ContextTypes.DEFAULT_TYPE):
         lat, lon = geocode(context.user_data.get("collection", ""), context.user_data["country"])
         context.user_data["col_lat"] = lat
         context.user_data["col_lon"] = lon
+    # Matched-job flow -> offer the one-tap port confirm; manual flow -> full port list.
+    if context.user_data.get("job_summary"):
+        return await offer_port(update, context)
     return await ask_port(update, context)
 
 
+async def offer_port(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """When we can guess the port from the job/ferry data, offer a one-tap
+    confirmation with a 'Different port' fallback. Otherwise show the full list."""
+    suggested = context.user_data.get("suggested_port")
+    if suggested and suggested in PORTS:
+        await update.message.reply_text(
+            f"Looks like you're heading to *{suggested}*.\n\nConfirm, or pick a different port:",
+            parse_mode="Markdown",
+            reply_markup=build_keyboard([f"Yes - {suggested}", "Different port"], cols=1),
+        )
+        return PORT_CONFIRM
+    return await ask_port(update, context)
+
+
+async def port_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = update.message.text.strip()
+    if "different" in text.lower():
+        return await ask_port(update, context)
+    suggested = context.user_data.get("suggested_port")
+    context.user_data["port"] = suggested or match_port(text) or text
+    return await proceed_after_port(update, context)
+
+
 async def ask_port(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    names = port_keyboard_names()
-    hint = "\n\nOr *type* any other port." if TOP_PORTS else ""
     await update.message.reply_text(
-        f"Which *port* are you heading to?{hint}",
+        "Which *port* are you heading to?",
         parse_mode="Markdown",
-        reply_markup=build_keyboard(names, cols=2),
+        reply_markup=build_keyboard(list(PORTS.keys()), cols=2),
     )
     return PORT
 
@@ -841,6 +740,10 @@ async def ask_port(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def get_port(update: Update, context: ContextTypes.DEFAULT_TYPE):
     typed = update.message.text.strip()
     context.user_data["port"] = match_port(typed) or typed
+    return await proceed_after_port(update, context)
+
+
+async def proceed_after_port(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data["chat_id"] = update.effective_chat.id
 
     country = context.user_data.get("country", "")
@@ -972,23 +875,20 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 def main():
     load_address_book()
-    load_ports_from_api()
-    history = API.job_history() if API.enabled else []
-    build_frequent_collection_points(jobs=history)
-    rank_ports_by_usage(history)
     print(f"Move IT API: {'ENABLED at ' + MOVEIT_BASE_URL if API.enabled else 'not configured - manual flow only'}")
     app = Application.builder().token(BOT_TOKEN).build()
     conv = ConversationHandler(
         entry_points=[CommandHandler("start", start), MessageHandler(filters.TEXT & ~filters.COMMAND, start)],
         states={
-            TRAILER:     [MessageHandler(filters.TEXT & ~filters.COMMAND, get_trailer)],
-            JOB_CONFIRM: [MessageHandler(filters.TEXT & ~filters.COMMAND, job_confirm)],
-            COLLECTION:  [MessageHandler(filters.TEXT & ~filters.COMMAND, get_collection)],
-            COUNTRY:     [MessageHandler(filters.TEXT & ~filters.COMMAND, get_country)],
-            PORT:        [MessageHandler(filters.TEXT & ~filters.COMMAND, get_port)],
-            DOCS:        [MessageHandler(filters.TEXT | filters.PHOTO | filters.Document.ALL, get_docs)],
-            NOTES:       [MessageHandler(filters.TEXT & ~filters.COMMAND, get_notes)],
-            CONFIRM:     [MessageHandler(filters.TEXT & ~filters.COMMAND, confirm)],
+            TRAILER:      [MessageHandler(filters.TEXT & ~filters.COMMAND, get_trailer)],
+            JOB_CONFIRM:  [MessageHandler(filters.TEXT & ~filters.COMMAND, job_confirm)],
+            COLLECTION:   [MessageHandler(filters.TEXT & ~filters.COMMAND, get_collection)],
+            COUNTRY:      [MessageHandler(filters.TEXT & ~filters.COMMAND, get_country)],
+            PORT:         [MessageHandler(filters.TEXT & ~filters.COMMAND, get_port)],
+            PORT_CONFIRM: [MessageHandler(filters.TEXT & ~filters.COMMAND, port_confirm)],
+            DOCS:         [MessageHandler(filters.TEXT | filters.PHOTO | filters.Document.ALL, get_docs)],
+            NOTES:        [MessageHandler(filters.TEXT & ~filters.COMMAND, get_notes)],
+            CONFIRM:      [MessageHandler(filters.TEXT & ~filters.COMMAND, confirm)],
         },
         fallbacks=[CommandHandler("cancel", cancel)],
     )
