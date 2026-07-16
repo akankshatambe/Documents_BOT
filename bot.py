@@ -404,79 +404,11 @@ def load_ports_from_api():
 
 PORT_ALIASES = {}      # normalized alias -> canonical port name
 PORT_ADDR_CODES = {}   # normalized ferryport address code -> canonical port name
-TOP_PORTS = []         # most-used ports (keyboard order); empty = show all
 
 
 _FERRYISH = ("ferry", "boat", "tunnel", "crossing", "sail", "port", "checkin", "check-in")
 
 
-def rank_ports_by_usage(jobs, top_n=10):
-    """Rank ports by how often job history references them. Only trusted evidence counts:
-    the job's ferry/crossing field, an exact ferryport address-code match on a stop,
-    or a ferry/tunnel-type stop action. Plain delivery addresses in a port town don't count."""
-    global TOP_PORTS
-    if not jobs:
-        print("[port-rank] no job history - keyboard will show all ports")
-        return
-
-    aliases = dict(PORT_ALIASES)
-    for name in PORTS:  # ensure fallback-mode port names are matchable too
-        aliases.setdefault(_norm(name), name)
-
-    def _fuzzy(text):
-        n = _norm(text or "")
-        if not n:
-            return None
-        if n in aliases:
-            return aliases[n]
-        return next((pname for a, pname in aliases.items() if a in n or n in a), None)
-
-    def _fuzzy_all(text):
-        """A ferry booking like 'Dublin Port - Holyhead 22:30' names both ends - match every port in it."""
-        n = _norm(text or "")
-        if not n:
-            return set()
-        return {pname for a, pname in aliases.items() if a in n}
-
-    counts, matched_jobs = {}, 0
-    for job in jobs:
-        hits = set()
-        ferry_text = _as_text(_find_key(job, "ferrybooking", "ferry", "crossing"))
-        if ferry_text:
-            hits |= _fuzzy_all(ferry_text)
-        for stop in _find_key(job, "stops") or []:
-            addr = _find_key(stop, "address")
-            addr = addr if isinstance(addr, dict) else {}
-            code = _norm(_find_key(addr, "code") or "")
-            if code and code in PORT_ADDR_CODES:
-                hits.add(PORT_ADDR_CODES[code])
-                continue
-            action = _stop_action_text(stop)
-            if any(k in action for k in _FERRYISH):
-                hit = _fuzzy(_find_key(addr, "name")) or _fuzzy(_find_key(addr, "town")) or _fuzzy(_find_key(addr, "code"))
-                if hit:
-                    hits.add(hit)
-        if hits:
-            matched_jobs += 1
-            for p in hits:
-                counts[p] = counts.get(p, 0) + 1
-
-    if not counts:
-        print("[port-rank] no port references found in job history - keyboard will show all ports")
-        return
-
-    # Merge case/spelling twins ('NorthLink Ferries' vs 'Northlink Ferries') before ranking
-    merged = {}
-    for name, count in counts.items():
-        key = _norm(name)
-        if key in merged:
-            merged[key] = (merged[key][0], merged[key][1] + count)
-        else:
-            merged[key] = (name, count)
-    ranked = sorted(merged.values(), key=lambda kv: kv[1], reverse=True)
-    TOP_PORTS = [p for p, _ in ranked[:top_n]]
-    print(f"[port-rank] {matched_jobs}/{len(jobs)} jobs referenced a port; "
-          f"top {len(TOP_PORTS)}: {ranked[:top_n]}")
 
 
 def port_keyboard_names():
@@ -1169,26 +1101,55 @@ def _towing_vehicle(trailer_loc):
 
 
 def find_trailer_run(trailer_code, trailer_id, trailer=None):
-    """Trailer -> today's run. Direct trailer assignment first (rare, but future-proof),
-    then the physical correlation: which assigned VEHICLE is towing this trailer right now."""
-    info = ASSIGNMENTS["by_trailer"].get(_norm(trailer_code or ""))
+    """Trailer -> today's run. Logs exactly why matching failed, so failures are
+    diagnosable from a single [match] log line instead of guesswork."""
+    by_t, by_v = ASSIGNMENTS["by_trailer"], ASSIGNMENTS["by_vehicle"]
+    n_groups = len({v.get("group_id") for v in list(by_t.values()) + list(by_v.values())})
+    info = by_t.get(_norm(trailer_code or ""))
     matched_via = "trailer assignment"
-    if not info and isinstance(trailer, dict):
-        loc = _find_key(trailer, "trackinglocation")
-        if isinstance(loc, dict):
-            tow = _towing_vehicle(loc)
-            if tow:
-                vid, vcode = tow
-                info = ASSIGNMENTS["by_vehicle"].get(vid) or ASSIGNMENTS["by_vehicle"].get(_norm(vcode))
-                matched_via = f"towing vehicle {vcode or vid}"
+
     if not info:
-        return None
-    print(f"[assignments] matched {trailer_code} via {matched_via} -> group {info.get('group_id')}")
+        if not by_v:
+            print(f"[match] {trailer_code}: FAIL - assignments map has no vehicles "
+                  f"({n_groups} groups known). Map not warm yet, or groups carry no Vehicle.")
+            return None
+        loc = _find_key(trailer, "trackinglocation") if isinstance(trailer, dict) else None
+        if not isinstance(loc, dict) or _find_key(loc, "lat") is None:
+            print(f"[match] {trailer_code}: FAIL - trailer has no GPS position to correlate")
+            return None
+        vehicles = API.all_vehicles()
+        if not vehicles:
+            print(f"[match] {trailer_code}: FAIL - GET vehicle returned nothing")
+            return None
+        with_gps = sum(1 for v in vehicles
+                       if isinstance(_find_key(v, "trackinglocation"), dict)
+                       and _find_key(_find_key(v, "trackinglocation"), "lat") is not None)
+        tow = _towing_vehicle(loc)
+        if not tow:
+            spd = _find_key(loc, "speed") or 0
+            print(f"[match] {trailer_code}: FAIL - no towing vehicle found "
+                  f"(trailer speed {spd}, {with_gps}/{len(vehicles)} vehicles have GPS). "
+                  f"Trailer parked/ambiguous, or towing truck not in vehicle list.")
+            return None
+        vid, vcode = tow
+        info = by_v.get(vid) or by_v.get(_norm(vcode))
+        if not info:
+            print(f"[match] {trailer_code}: FAIL - towing vehicle {vcode or vid} (id={vid}) found, "
+                  f"but no group today has that vehicle assigned. "
+                  f"Group vehicle ids known: {sorted(k for k in by_v if isinstance(k, int))[:10]}")
+            return None
+        matched_via = f"towing vehicle {vcode or vid}"
+
     s = extract_job_summary({"stops": info["stops"]})
     if info.get("customer") and not s.get("customer"):
         s["customer"] = info["customer"]
     if info.get("driver"):
         s["driver"] = info["driver"]
+    if not s.get("collection"):
+        print(f"[match] {trailer_code}: matched group {info.get('group_id')} via {matched_via}, "
+              f"but its stops have no Collection-type action - cannot prefill")
+        return None
+    print(f"[match] {trailer_code}: SUCCESS via {matched_via} -> group {info.get('group_id')}")
     return s
 
 
@@ -1374,7 +1335,7 @@ async def get_country(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def ask_port(update: Update, context: ContextTypes.DEFAULT_TYPE):
     names = port_keyboard_names()
-    hint = "\n\nOr *type* any other port." if TOP_PORTS else ""
+    hint = "\n\nOr *type* any other port."
     await update.message.reply_text(
         f"Which *port* are you heading to?{hint}",
         parse_mode="Markdown",
@@ -1685,7 +1646,7 @@ def main():
         fallbacks=[CommandHandler("cancel", cancel)],
     )
     app.add_handler(conv)
-    print("Bot v7 is running...")
+    print("=== Bot v7.2 FINAL is running ===")
     app.run_polling()
 
 
