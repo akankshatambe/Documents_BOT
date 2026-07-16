@@ -79,6 +79,10 @@ class MoveItAPI:
             return data
         return None
 
+    def all_vehicles(self):
+        data = self._get("vehicle", quiet=True)
+        return data if isinstance(data, list) else []
+
     def todays_jobs(self):
         today = date.today().strftime("%Y-%m-%d")
         data = self._get("job", params={"fromdate": today, "todate": today})
@@ -226,53 +230,6 @@ def _group_cached(gid):
     return _GROUP_CACHE[key]
 
 
-def find_trailer_run(trailer_code, trailer_id):
-    """Trailer -> today's run, via groups (the planning unit that carries assignments):
-    today's jobs -> their groupids -> GET group/{gid} -> match Trailer id/code ->
-    every job sharing that groupid is a leg of this trailer's run."""
-    jobs = API.todays_jobs()
-    gids = []
-    for job in jobs:
-        for stop in _find_key(job, "stops") or []:
-            gid = _find_key(stop, "groupid")
-            if gid is not None and gid not in gids:
-                gids.append(gid)
-
-    code_n = _norm(trailer_code)
-    matched_gid = None
-    for gid in gids:
-        g = _group_cached(gid)
-        if not g or not _find_key(g, "hastrailer"):
-            continue
-        t = _find_key(g, "trailer")
-        if isinstance(t, dict):
-            if (trailer_id is not None and _find_key(t, "id") == trailer_id) or \
-               _norm(_as_text(_find_key(t, "code", "registration")) or "") == code_n:
-                matched_gid = gid
-                break
-        elif t is not None and _norm(str(t)) == code_n:
-            matched_gid = gid
-            break
-    if matched_gid is None:
-        return None
-
-    legs, combined_stops, customer = [], [], None
-    for job in jobs:
-        stops = _find_key(job, "stops") or []
-        if any(_find_key(s, "groupid") == matched_gid for s in stops):
-            legs.append(job)
-            combined_stops.extend(stops)
-            customer = customer or _as_text(_find_key(job, "customer"))
-
-    summary = extract_job_summary({"stops": combined_stops})
-    summary["customer"] = customer
-    summary["job_id"] = _find_key(legs[0], "id", "jobid") if legs else None
-    g = _group_cached(matched_gid)
-    drv = _find_key(g, "driver") if g else None
-    if isinstance(drv, dict):
-        name = " ".join(x for x in [_find_key(drv, "firstname"), _find_key(drv, "surname")] if x).strip()
-        summary["driver"] = name or _as_text(_find_key(drv, "code"))
-    return summary
 
 
 def job_matches_trailer(job, trailer_code, trailer_id):
@@ -1033,18 +990,81 @@ async def relay_to_team(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return ConversationHandler.END
 
 
-ASSIGNMENTS = {"ts": 0.0, "by_trailer": {}}
+ASSIGNMENTS = {"ts": 0.0, "by_trailer": {}, "by_vehicle": {}}
+JOBSCAN = {"max_id": 0, "probed": set(), "day": None, "jobs": {}}
+
+
+def _note_ids(jobs):
+    """Track the highest job id seen anywhere - the watermark for id-scan fallback."""
+    for j in jobs or []:
+        jid = _find_key(j, "id", "jobid")
+        if isinstance(jid, int) and jid > JOBSCAN["max_id"]:
+            JOBSCAN["max_id"] = jid
+
+
+def scan_jobs_fallback(max_probes=1200, back_window=1200, fwd_window=400):
+    """When the day query is poisoned (Move IT's DBNull 500), fetch jobs one by one:
+    GET job/{id} still works. Scan an id window around the watermark, keep today's jobs.
+    Results accumulate across cycles, so later cycles only probe new ids."""
+    today = date.today()
+    if JOBSCAN["day"] != today:
+        JOBSCAN["day"], JOBSCAN["probed"], JOBSCAN["jobs"] = today, set(), {}
+
+    if JOBSCAN["max_id"] == 0:
+        # Seed the watermark from the most recent day that still serves
+        for back in range(1, 8):
+            d = (today - timedelta(days=back)).strftime("%Y-%m-%d")
+            data = API._get("job", params={"fromdate": d, "todate": d}, quiet=True)
+            if isinstance(data, list) and data:
+                _note_ids(data)
+                break
+    if JOBSCAN["max_id"] == 0:
+        print("[assignments] id-scan fallback: no watermark available yet")
+        return list(JOBSCAN["jobs"].values())
+
+    today_str = today.strftime("%Y-%m-%d")
+    lo = max(1, JOBSCAN["max_id"] - back_window)
+    hi = JOBSCAN["max_id"] + fwd_window
+    probes = 0
+    for jid in range(hi, lo - 1, -1):  # newest first - today's jobs cluster at the top
+        if probes >= max_probes:
+            break
+        if jid in JOBSCAN["probed"]:
+            continue
+        JOBSCAN["probed"].add(jid)
+        probes += 1
+        j = API._get(f"job/{jid}", quiet=True)
+        if not isinstance(j, dict):
+            continue
+        _note_ids([j])
+        for stop in _find_key(j, "stops") or []:
+            if str(_find_key(stop, "stopdatetime") or "").startswith(today_str):
+                JOBSCAN["jobs"][jid] = j
+                break
+    print(f"[assignments] id-scan fallback: probed {probes} ids this cycle, "
+          f"{len(JOBSCAN['jobs'])} jobs for today so far")
+    return list(JOBSCAN["jobs"].values())
 
 
 def refresh_assignments():
     """Jobs carry no trailer, but every stop has a groupid, and GET group/{id}
-    returns that day's Driver/Vehicle/Trailer assignment. Build a trailer -> run map."""
+    returns that day's assignments. Planners assign VEHICLES (not trailers), so we
+    build both maps: trailer -> run (in case practice changes) and vehicle -> run
+    (used by the GPS towing correlation)."""
     if not API.enabled:
         return
     jobs = API.todays_jobs()
+    if jobs:
+        _note_ids(jobs)
+    else:
+        # Day query poisoned (null-date record) or empty - fall back to id scanning
+        jobs = scan_jobs_fallback()
     by_gid = {}
+    stop_level_trailers = {}
     for job in jobs:
         cust = _as_text(_find_key(job, "customer")) or ""
+        # Per the API schema, stops CAN carry driver/vehicle/trailer (omitted when null)
+        jt = _find_key(job, "trailer")
         for stop in _find_key(job, "stops") or []:
             gid = _find_key(stop, "groupid")
             if gid is not None:
@@ -1052,30 +1072,43 @@ def refresh_assignments():
                 entry["stops"].append(stop)
                 if cust and not entry["customer"]:
                     entry["customer"] = cust
-    by_trailer = {}
+                st = _find_key(stop, "trailer") or jt
+                if isinstance(st, dict):
+                    c = _find_key(st, "code", "registration")
+                    if isinstance(c, str) and c.strip():
+                        stop_level_trailers[_norm(c)] = gid
+    if stop_level_trailers:
+        print(f"[assignments] stop-level trailer assignments found: {sorted(stop_level_trailers)[:8]}")
+
+    by_trailer, by_vehicle = {}, {}
     for gid, entry in list(by_gid.items())[:200]:
         g = API._get(f"group/{gid}", quiet=True)
         if not isinstance(g, dict):
             continue
+        info = {"group_id": gid, "stops": entry["stops"], "customer": entry["customer"],
+                "driver": _as_text(_find_key(g, "driver")) or ""}
         t = _find_key(g, "trailer")
-        code = None
-        if isinstance(t, dict):
-            code = _find_key(t, "code", "registration")
-        elif isinstance(t, str):
-            code = t
-        if isinstance(code, str):
-            code = code.strip()
-        if code:
-            by_trailer[_norm(code)] = {
-                "group_id": gid,
-                "stops": entry["stops"],
-                "customer": entry["customer"],
-                "driver": _as_text(_find_key(g, "driver")) or "",
-            }
+        code = _find_key(t, "code", "registration") if isinstance(t, dict) else (t if isinstance(t, str) else None)
+        if isinstance(code, str) and code.strip():
+            by_trailer[_norm(code)] = info
+        v = _find_key(g, "vehicle")
+        if isinstance(v, dict):
+            vid = _find_key(v, "id")
+            if vid is not None:
+                by_vehicle[vid] = info
+            vcode = _find_key(v, "code", "registration")
+            if isinstance(vcode, str) and vcode.strip():
+                by_vehicle[_norm(vcode)] = info
+    for code_n, gid in stop_level_trailers.items():
+        if gid in by_gid and code_n not in by_trailer:
+            by_trailer[code_n] = {"group_id": gid, "stops": by_gid[gid]["stops"],
+                                   "customer": by_gid[gid]["customer"], "driver": ""}
+
     ASSIGNMENTS["by_trailer"] = by_trailer
+    ASSIGNMENTS["by_vehicle"] = by_vehicle
     ASSIGNMENTS["ts"] = time.time()
-    print(f"[assignments] {len(by_gid)} groups today, {len(by_trailer)} with trailers"
-          + (f": {sorted(by_trailer)[:8]}" if by_trailer else ""))
+    print(f"[assignments] {len(by_gid)} groups today, {len(by_trailer)} with trailers, "
+          f"{sum(1 for k in by_vehicle if isinstance(k, int))} with vehicles")
 
 
 def assignments_loop():
@@ -1088,12 +1121,69 @@ def assignments_loop():
         time.sleep(600)
 
 
-def find_trailer_run(trailer_code, trailer_id):
-    """Instant lookup against the background-built map. Returns a job-style
-    summary of today's run for this trailer, or None."""
+def _haversine_m(lat1, lon1, lat2, lon2):
+    import math
+    r = 6371000.0
+    p1, p2 = math.radians(float(lat1)), math.radians(float(lat2))
+    dp, dl = p2 - p1, math.radians(float(lon2) - float(lon1))
+    a = math.sin(dp / 2) ** 2 + math.cos(p1) * math.cos(p2) * math.sin(dl / 2) ** 2
+    return 2 * r * math.asin(math.sqrt(a))
+
+
+def _towing_vehicle(trailer_loc):
+    """The truck physically coupled to the trailer: near-identical GPS position,
+    and matching speed when moving. Returns (vehicle_id, vehicle_code) or None."""
+    tlat, tlon = _find_key(trailer_loc, "lat"), _find_key(trailer_loc, "lon")
+    if tlat is None or tlon is None:
+        return None
+    tspd = float(_find_key(trailer_loc, "speed") or 0)
+    moving = tspd >= 15
+    cands = []
+    for v in API.all_vehicles():
+        loc = _find_key(v, "trackinglocation")
+        if not isinstance(loc, dict):
+            continue
+        vlat, vlon = _find_key(loc, "lat"), _find_key(loc, "lon")
+        if vlat is None or vlon is None:
+            continue
+        try:
+            d = _haversine_m(tlat, tlon, vlat, vlon)
+        except (TypeError, ValueError):
+            continue
+        vspd = float(_find_key(loc, "speed") or 0)
+        if moving:
+            if d <= 300 and abs(vspd - tspd) <= 20:
+                cands.append((d, v))
+        else:
+            if d <= 250:
+                cands.append((d, v))
+    if not cands:
+        return None
+    cands.sort(key=lambda c: c[0])
+    if not moving:
+        # Stationary in a yard: only trust a clear, unambiguous winner
+        if cands[0][0] > 120 or (len(cands) > 1 and cands[1][0] < 250):
+            return None
+    v = cands[0][1]
+    return _find_key(v, "id"), (_find_key(v, "code", "registration") or "")
+
+
+def find_trailer_run(trailer_code, trailer_id, trailer=None):
+    """Trailer -> today's run. Direct trailer assignment first (rare, but future-proof),
+    then the physical correlation: which assigned VEHICLE is towing this trailer right now."""
     info = ASSIGNMENTS["by_trailer"].get(_norm(trailer_code or ""))
+    matched_via = "trailer assignment"
+    if not info and isinstance(trailer, dict):
+        loc = _find_key(trailer, "trackinglocation")
+        if isinstance(loc, dict):
+            tow = _towing_vehicle(loc)
+            if tow:
+                vid, vcode = tow
+                info = ASSIGNMENTS["by_vehicle"].get(vid) or ASSIGNMENTS["by_vehicle"].get(_norm(vcode))
+                matched_via = f"towing vehicle {vcode or vid}"
     if not info:
         return None
+    print(f"[assignments] matched {trailer_code} via {matched_via} -> group {info.get('group_id')}")
     s = extract_job_summary({"stops": info["stops"]})
     if info.get("customer") and not s.get("customer"):
         s["customer"] = info["customer"]
@@ -1152,7 +1242,7 @@ async def get_trailer(update: Update, context: ContextTypes.DEFAULT_TYPE):
             trailer_id = _find_key(trailer, "id")
 
             # Groups carry the trailer assignment - match today's run through them
-            s = find_trailer_run(trailer_code, trailer_id)
+            s = find_trailer_run(trailer_code, trailer_id, trailer)
             if s and s.get("collection"):
                 context.user_data["job_summary"] = s
                 context.user_data["collection"] = s["collection"]
@@ -1565,6 +1655,7 @@ def refresh_datasets():
     fallback quick points / full port list serve until this finishes."""
     try:
         history = API.job_history() if API.enabled else []
+        _note_ids(history)
         build_frequent_collection_points(jobs=history)
         print("[datasets] background refresh complete")
     except Exception as e:
