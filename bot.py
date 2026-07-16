@@ -84,17 +84,10 @@ class MoveItAPI:
         data = self._get("job", params={"fromdate": today, "todate": today})
         return data if isinstance(data, list) else []
 
-    def manifests_for(self, day=None):
-        """Manifests are the planning unit: a trailer/vehicle/driver + a run of stops for a date."""
-        d = day or date.today()
-        data = self._get("manifest", params={"manifestdate": d.strftime("%Y-%m-%d")})
-        if not (isinstance(data, list) and data):
-            data = self._get("manifest", params={"manifestdate": d.strftime("%d-%m-%Y")})
-        return data if isinstance(data, list) else []
-
-    def manifest_stops(self, manifest_id):
-        data = self._get(f"manifest/{manifest_id}/manifeststops")
-        return data if isinstance(data, list) else []
+    def get_group(self, gid):
+        """Groups are Move IT's planning unit - they carry the driver/vehicle/trailer assignment."""
+        data = self._get(f"group/{gid}", quiet=True)
+        return data if isinstance(data, dict) else None
 
     def job_history(self, days=90, chunk_days=7):
         """Pull job history in small windows. Move IT's job endpoint 500s
@@ -221,6 +214,65 @@ def extract_job_summary(job):
         "to_c": _as_text(_find_key(job, "to", "tocountry", "destination")),
         "ferry": _as_text(_find_key(job, "ferrybooking", "ferry", "crossing")),
     }
+
+
+_GROUP_CACHE = {}  # (date, gid) -> group JSON, so repeat lookups don't re-hit the API
+
+
+def _group_cached(gid):
+    key = (date.today(), gid)
+    if key not in _GROUP_CACHE:
+        _GROUP_CACHE[key] = API.get_group(gid)
+    return _GROUP_CACHE[key]
+
+
+def find_trailer_run(trailer_code, trailer_id):
+    """Trailer -> today's run, via groups (the planning unit that carries assignments):
+    today's jobs -> their groupids -> GET group/{gid} -> match Trailer id/code ->
+    every job sharing that groupid is a leg of this trailer's run."""
+    jobs = API.todays_jobs()
+    gids = []
+    for job in jobs:
+        for stop in _find_key(job, "stops") or []:
+            gid = _find_key(stop, "groupid")
+            if gid is not None and gid not in gids:
+                gids.append(gid)
+
+    code_n = _norm(trailer_code)
+    matched_gid = None
+    for gid in gids:
+        g = _group_cached(gid)
+        if not g or not _find_key(g, "hastrailer"):
+            continue
+        t = _find_key(g, "trailer")
+        if isinstance(t, dict):
+            if (trailer_id is not None and _find_key(t, "id") == trailer_id) or \
+               _norm(_as_text(_find_key(t, "code", "registration")) or "") == code_n:
+                matched_gid = gid
+                break
+        elif t is not None and _norm(str(t)) == code_n:
+            matched_gid = gid
+            break
+    if matched_gid is None:
+        return None
+
+    legs, combined_stops, customer = [], [], None
+    for job in jobs:
+        stops = _find_key(job, "stops") or []
+        if any(_find_key(s, "groupid") == matched_gid for s in stops):
+            legs.append(job)
+            combined_stops.extend(stops)
+            customer = customer or _as_text(_find_key(job, "customer"))
+
+    summary = extract_job_summary({"stops": combined_stops})
+    summary["customer"] = customer
+    summary["job_id"] = _find_key(legs[0], "id", "jobid") if legs else None
+    g = _group_cached(matched_gid)
+    drv = _find_key(g, "driver") if g else None
+    if isinstance(drv, dict):
+        name = " ".join(x for x in [_find_key(drv, "firstname"), _find_key(drv, "surname")] if x).strip()
+        summary["driver"] = name or _as_text(_find_key(drv, "code"))
+    return summary
 
 
 def job_matches_trailer(job, trailer_code, trailer_id):
@@ -892,6 +944,8 @@ def post_to_teams(data):
             facts.append({"title": "Delivery", "value": job["delivery"]})
         if job.get("ferry"):
             facts.append({"title": "Ferry booking", "value": job["ferry"]})
+        if job.get("driver"):
+            facts.append({"title": "Driver (Move IT)", "value": job["driver"]})
     if data.get("live_text"):
         facts.append({"title": "Trailer last seen", "value": data["live_text"]})
 
@@ -979,6 +1033,75 @@ async def relay_to_team(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return ConversationHandler.END
 
 
+ASSIGNMENTS = {"ts": 0.0, "by_trailer": {}}
+
+
+def refresh_assignments():
+    """Jobs carry no trailer, but every stop has a groupid, and GET group/{id}
+    returns that day's Driver/Vehicle/Trailer assignment. Build a trailer -> run map."""
+    if not API.enabled:
+        return
+    jobs = API.todays_jobs()
+    by_gid = {}
+    for job in jobs:
+        cust = _as_text(_find_key(job, "customer")) or ""
+        for stop in _find_key(job, "stops") or []:
+            gid = _find_key(stop, "groupid")
+            if gid is not None:
+                entry = by_gid.setdefault(gid, {"stops": [], "customer": cust})
+                entry["stops"].append(stop)
+                if cust and not entry["customer"]:
+                    entry["customer"] = cust
+    by_trailer = {}
+    for gid, entry in list(by_gid.items())[:200]:
+        g = API._get(f"group/{gid}", quiet=True)
+        if not isinstance(g, dict):
+            continue
+        t = _find_key(g, "trailer")
+        code = None
+        if isinstance(t, dict):
+            code = _find_key(t, "code", "registration")
+        elif isinstance(t, str):
+            code = t
+        if isinstance(code, str):
+            code = code.strip()
+        if code:
+            by_trailer[_norm(code)] = {
+                "group_id": gid,
+                "stops": entry["stops"],
+                "customer": entry["customer"],
+                "driver": _as_text(_find_key(g, "driver")) or "",
+            }
+    ASSIGNMENTS["by_trailer"] = by_trailer
+    ASSIGNMENTS["ts"] = time.time()
+    print(f"[assignments] {len(by_gid)} groups today, {len(by_trailer)} with trailers"
+          + (f": {sorted(by_trailer)[:8]}" if by_trailer else ""))
+
+
+def assignments_loop():
+    """Keeps the trailer -> run map warm so driver lookups are instant."""
+    while True:
+        try:
+            refresh_assignments()
+        except Exception as e:
+            print(f"[assignments] refresh failed: {e}")
+        time.sleep(600)
+
+
+def find_trailer_run(trailer_code, trailer_id):
+    """Instant lookup against the background-built map. Returns a job-style
+    summary of today's run for this trailer, or None."""
+    info = ASSIGNMENTS["by_trailer"].get(_norm(trailer_code or ""))
+    if not info:
+        return None
+    s = extract_job_summary({"stops": info["stops"]})
+    if info.get("customer") and not s.get("customer"):
+        s["customer"] = info["customer"]
+    if info.get("driver"):
+        s["driver"] = info["driver"]
+    return s
+
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     last = context.user_data.get("last")
     context.user_data.clear()
@@ -1028,47 +1151,24 @@ async def get_trailer(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
             trailer_id = _find_key(trailer, "id")
 
-            # Manifests are the planning unit that actually carries trailer assignments
-            manifest = find_manifest_for_trailer(trailer_code, trailer_id)
-            if manifest:
-                s = manifest_summary(manifest)
-                if s.get("collection"):
-                    context.user_data["job_summary"] = s
-                    context.user_data["collection"] = s["collection"]
-                    lines = [f"*Found your run in Move IT:*\n"]
-                    if s.get("customer"):
-                        lines.append(f"Customer: {md(s['customer'])}")
-                    lines.append(f"Collection: {md(s['collection'])}")
-                    if s.get("delivery"):
-                        lines.append(f"Delivery: {md(s['delivery'])}")
-                    lines.append("\nIs this your load?")
-                    await update.message.reply_text(
-                        "\n".join(lines),
-                        parse_mode="Markdown",
-                        reply_markup=build_keyboard(["Yes, that's my load", "No - enter details myself"], cols=1),
-                    )
-                    return JOB_CONFIRM
-
-            for job in API.todays_jobs():
-                if job_matches_trailer(job, trailer_code, trailer_id):
-                    s = extract_job_summary(job)
-                    context.user_data["job_summary"] = s
-                    if s.get("collection"):
-                        context.user_data["collection"] = s["collection"]
-                    lines = [f"*Found your job in Move IT:*\n"]
-                    if s.get("customer"):
-                        lines.append(f"Customer: {md(s['customer'])}")
-                    if s.get("collection"):
-                        lines.append(f"Collection: {md(s['collection'])}")
-                    if s.get("delivery"):
-                        lines.append(f"Delivery: {md(s['delivery'])}")
-                    lines.append("\nIs this your load?")
-                    await update.message.reply_text(
-                        "\n".join(lines),
-                        parse_mode="Markdown",
-                        reply_markup=build_keyboard(["Yes, that's my load", "No - enter details myself"], cols=1),
-                    )
-                    return JOB_CONFIRM
+            # Groups carry the trailer assignment - match today's run through them
+            s = find_trailer_run(trailer_code, trailer_id)
+            if s and s.get("collection"):
+                context.user_data["job_summary"] = s
+                context.user_data["collection"] = s["collection"]
+                lines = [f"*Found your run in Move IT:*\n"]
+                if s.get("customer"):
+                    lines.append(f"Customer: {md(s['customer'])}")
+                lines.append(f"Collection: {md(s['collection'])}")
+                if s.get("delivery"):
+                    lines.append(f"Delivery: {md(s['delivery'])}")
+                lines.append("\nIs this your load?")
+                await update.message.reply_text(
+                    "\n".join(lines),
+                    parse_mode="Markdown",
+                    reply_markup=build_keyboard(["Yes, that's my load", "No - enter details myself"], cols=1),
+                )
+                return JOB_CONFIRM
 
     # --- Fallback: manual v3 flow ---
     names = list(QUICK_POINTS.keys())
@@ -1451,173 +1551,12 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return ConversationHandler.END
 
 
-def find_manifest_for_trailer(trailer_code, trailer_id):
-    """Find today's manifest for a trailer. Tries likely field names first, then falls
-    back to matching the trailer code anywhere in the manifest JSON - schema-agnostic."""
-    import json as _json
-    code_n = _norm(trailer_code)
-    pattern = re.compile(rf"\b{re.escape(trailer_code.upper())}\b")
-    for m in API.manifests_for():
-        t = _find_key(m, "trailer", "trailercode", "trailerid")
-        if isinstance(t, dict):
-            if _norm(_find_key(t, "code", "registration") or "") == code_n:
-                return m
-            if trailer_id is not None and _find_key(t, "id") == trailer_id:
-                return m
-        elif t is not None and _norm(str(t)) == code_n:
-            return m
-        try:
-            if pattern.search(_json.dumps(m).upper()):
-                return m
-        except (TypeError, ValueError):
-            continue
-    return None
 
 
-def manifest_summary(manifest):
-    """Extract a job-style summary from a manifest, fetching its stops if needed.
-    Manifest stop shapes are unknown, so each stop is normalized defensively."""
-    stops = _find_key(manifest, "stops", "manifeststops")
-    if not stops:
-        mid = _find_key(manifest, "id", "manifestid")
-        if mid is not None:
-            stops = API.manifest_stops(mid)
-    normalized = []
-    for s in stops or []:
-        if not isinstance(s, dict):
-            continue
-        inner = _find_key(s, "stop", "jobstop")
-        normalized.append(inner if isinstance(inner, dict) else s)
-    if not normalized:
-        return {}
-    return extract_job_summary({"stops": normalized})
 
 
-def _log_manifest_schema():
-    """Diagnostic: what do manifests actually contain?"""
-    try:
-        for back in range(0, 3):  # today, yesterday, day before (weekends)
-            day = date.today() - timedelta(days=back)
-            manifests = API.manifests_for(day)
-            if manifests:
-                break
-        else:
-            print("[schema] no manifests returned for the last 3 days")
-            return
-        m0 = manifests[0]
-        print(f"[schema] {len(manifests)} manifests on {day}; manifest keys: {sorted(m0.keys())}")
-        found = {}
-        def scan(obj, path=""):
-            if isinstance(obj, dict):
-                for k, v in obj.items():
-                    kl = str(k).lower()
-                    if kl not in ("region",) and any(
-                            t in kl for t in ("trail", "reg", "vehicle", "resource", "unit", "driver", "asset")):
-                        found.setdefault(f"{path}.{k}", repr(v)[:100])
-                    scan(v, f"{path}.{k}")
-            elif isinstance(obj, list):
-                for v in obj[:3]:
-                    scan(v, path + "[]")
-        scan(m0)
-        for k, v in list(found.items())[:15]:
-            print(f"[schema]   manifest {k} = {v}")
-        if not found:
-            print("[schema] manifest has no trailer/vehicle-ish fields at top level")
-        mid = _find_key(m0, "id", "manifestid")
-        if mid is not None:
-            ms = API.manifest_stops(mid)
-            if ms and isinstance(ms[0], dict):
-                print(f"[schema] manifest/{mid}/manifeststops[0] keys: {sorted(ms[0].keys())}")
-    except Exception as e:
-        print(f"[schema] manifest inspection failed: {e}")
 
 
-def _log_job_schema(history):
-    """One-time diagnostic: print the real Move IT job schema so trailer->job
-    matching can be wired to actual field names instead of guesses."""
-    try:
-        if not history:
-            print("[schema] no jobs to inspect")
-            return
-        job_keys, stop_keys, addr_keys = set(), set(), set()
-        interesting = {}  # keys that might hold a trailer/vehicle reference -> sample value
-
-        def scan(obj, path=""):
-            if isinstance(obj, dict):
-                for k, v in obj.items():
-                    kl = str(k).lower()
-                    if kl not in ("region",) and any(
-                            t in kl for t in ("trail", "reg", "vehicle", "resource", "unit", "driver", "asset")):
-                        interesting.setdefault(f"{path}.{k}", repr(v)[:80])
-                    scan(v, f"{path}.{k}")
-            elif isinstance(obj, list):
-                for v in obj[:3]:
-                    scan(v, path + "[]")
-
-        for job in history[:200]:
-            job_keys |= set(job.keys())
-            for stop in (job.get("stops") or [])[:5]:
-                if isinstance(stop, dict):
-                    stop_keys |= set(stop.keys())
-                    addr = stop.get("address")
-                    if isinstance(addr, dict):
-                        addr_keys |= set(addr.keys())
-            scan(job)
-
-        print(f"[schema] job keys: {sorted(job_keys)}")
-        print(f"[schema] stop keys: {sorted(stop_keys)}")
-        print(f"[schema] address keys: {sorted(addr_keys)}")
-        if interesting:
-            print(f"[schema] trailer/vehicle-ish fields found:")
-            for k, v in list(interesting.items())[:15]:
-                print(f"[schema]   {k} = {v}")
-        else:
-            print("[schema] NO trailer/vehicle-ish fields anywhere in the job list payload "
-                  "- trailer->job matching cannot work against this endpoint as-is")
-
-        # Probe: does the single-job detail endpoint return more than the list does?
-        jid = _find_key(history[0], "id", "jobid")
-        if jid is not None:
-            detail = API._get(f"job/{jid}")
-            if isinstance(detail, (dict, list)):
-                d0 = detail[0] if isinstance(detail, list) and detail else detail
-                if isinstance(d0, dict):
-                    extra = set(d0.keys()) - job_keys
-                    print(f"[schema] job/{jid} detail keys: {sorted(d0.keys())}")
-                    print(f"[schema] detail-only keys (not in list payload): {sorted(extra) or 'none'}")
-
-        # Probe: the group is the planning unit - does GET group/{id} exist,
-        # and does it carry the trailer/vehicle assignment?
-        for job in history:
-            gid = _find_key((_find_key(job, "stops") or [{}])[0], "groupid")
-            if gid is not None:
-                g = API._get(f"group/{gid}")
-                if isinstance(g, (dict, list)):
-                    g0 = g[0] if isinstance(g, list) and g else g
-                    if isinstance(g0, dict):
-                        print(f"[schema] group/{gid} keys: {sorted(g0.keys())}")
-                        ginteresting = {}
-                        def gscan(obj, path=""):
-                            if isinstance(obj, dict):
-                                for k, v in obj.items():
-                                    kl = str(k).lower()
-                                    if kl not in ("region",) and any(
-                                            t in kl for t in ("trail", "reg", "vehicle", "resource", "unit", "driver", "asset")):
-                                        ginteresting.setdefault(f"{path}.{k}", repr(v)[:100])
-                                    gscan(v, f"{path}.{k}")
-                            elif isinstance(obj, list):
-                                for v in obj[:3]:
-                                    gscan(v, path + "[]")
-                        gscan(g0)
-                        for k, v in list(ginteresting.items())[:15]:
-                            print(f"[schema]   group {k} = {v}")
-                        if not ginteresting:
-                            print("[schema] group payload has no trailer/vehicle-ish fields either")
-                else:
-                    print(f"[schema] group/{gid} not retrievable (see status above)")
-                break
-    except Exception as e:
-        print(f"[schema] inspection failed: {e}")
 
 
 def refresh_datasets():
@@ -1626,8 +1565,6 @@ def refresh_datasets():
     fallback quick points / full port list serve until this finishes."""
     try:
         history = API.job_history() if API.enabled else []
-        _log_job_schema(history)
-        _log_manifest_schema()
         build_frequent_collection_points(jobs=history)
         print("[datasets] background refresh complete")
     except Exception as e:
@@ -1638,6 +1575,7 @@ def main():
     load_address_book()
     load_ports_from_api()  # fast: single call, worth doing before polling starts
     threading.Thread(target=refresh_datasets, daemon=True).start()
+    threading.Thread(target=assignments_loop, daemon=True).start()
     print(f"Move IT API: {'ENABLED at ' + MOVEIT_BASE_URL if API.enabled else 'not configured - manual flow only'}")
     app = Application.builder().token(BOT_TOKEN).build()
     conv = ConversationHandler(
@@ -1656,7 +1594,7 @@ def main():
         fallbacks=[CommandHandler("cancel", cancel)],
     )
     app.add_handler(conv)
-    print("Bot v6 is running...")
+    print("Bot v7 is running...")
     app.run_polling()
 
 
