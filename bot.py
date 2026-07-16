@@ -84,6 +84,18 @@ class MoveItAPI:
         data = self._get("job", params={"fromdate": today, "todate": today})
         return data if isinstance(data, list) else []
 
+    def manifests_for(self, day=None):
+        """Manifests are the planning unit: a trailer/vehicle/driver + a run of stops for a date."""
+        d = day or date.today()
+        data = self._get("manifest", params={"manifestdate": d.strftime("%Y-%m-%d")})
+        if not (isinstance(data, list) and data):
+            data = self._get("manifest", params={"manifestdate": d.strftime("%d-%m-%Y")})
+        return data if isinstance(data, list) else []
+
+    def manifest_stops(self, manifest_id):
+        data = self._get(f"manifest/{manifest_id}/manifeststops")
+        return data if isinstance(data, list) else []
+
     def job_history(self, days=90, chunk_days=7):
         """Pull job history in small windows. Move IT's job endpoint 500s
         ('DBNull to Date') if any job in the requested range has a null date,
@@ -375,12 +387,10 @@ def load_ports_from_api():
         print("Ferry port data had no usable name/lat/lon - using fallback ports list")
         return
 
-    PORTS = loaded
-    NI_PORTS = _resolve_named_ports({"Larne", "Belfast"})
-    DIRECT_EU_PORTS = _resolve_named_ports({"Cherbourg"})
-    global IRISH_SEA_PORTS
-    IRISH_SEA_PORTS = _resolve_named_ports(_IRISH_SEA_KEYWORDS)
-    print(f"Loaded {len(PORTS)} ports from Move IT ferryport endpoint")
+    # Curated geographic ports take precedence; API operator entries sit underneath
+    # so typed names still match and route coordinates still resolve.
+    PORTS = {**loaded, **dict(FALLBACK_PORTS)}
+    print(f"Loaded {len(loaded)} ferry entries from Move IT (keyboard stays on geographic ports)")
 
 
 PORT_ALIASES = {}      # normalized alias -> canonical port name
@@ -461,7 +471,9 @@ def rank_ports_by_usage(jobs, top_n=10):
 
 
 def port_keyboard_names():
-    return TOP_PORTS if TOP_PORTS else list(PORTS.keys())
+    """Drivers pick geographic ports, not ferry operators - the curated list is the keyboard.
+    API-loaded entries stay in PORTS so typed names still match and get coordinates."""
+    return list(FALLBACK_PORTS.keys())
 
 TRAILER, JOB_CONFIRM, COLLECTION, COUNTRY, PORT, PBN, DOCS, CONFIRM, RELAY = range(9)
 
@@ -1015,6 +1027,28 @@ async def get_trailer(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 context.user_data["live_text"] = f"{text or ''} {('(' + str(when)[:16] + ')') if when else ''}".strip()
 
             trailer_id = _find_key(trailer, "id")
+
+            # Manifests are the planning unit that actually carries trailer assignments
+            manifest = find_manifest_for_trailer(trailer_code, trailer_id)
+            if manifest:
+                s = manifest_summary(manifest)
+                if s.get("collection"):
+                    context.user_data["job_summary"] = s
+                    context.user_data["collection"] = s["collection"]
+                    lines = [f"*Found your run in Move IT:*\n"]
+                    if s.get("customer"):
+                        lines.append(f"Customer: {md(s['customer'])}")
+                    lines.append(f"Collection: {md(s['collection'])}")
+                    if s.get("delivery"):
+                        lines.append(f"Delivery: {md(s['delivery'])}")
+                    lines.append("\nIs this your load?")
+                    await update.message.reply_text(
+                        "\n".join(lines),
+                        parse_mode="Markdown",
+                        reply_markup=build_keyboard(["Yes, that's my load", "No - enter details myself"], cols=1),
+                    )
+                    return JOB_CONFIRM
+
             for job in API.todays_jobs():
                 if job_matches_trailer(job, trailer_code, trailer_id):
                     s = extract_job_summary(job)
@@ -1174,29 +1208,21 @@ async def get_port(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def ask_docs(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Single combined step: documents + notes. Drivers send as many photos/files
-    and notes as they like, then tap Done."""
-    country = context.user_data.get("country", "")
+    """Single combined step: all paperwork + notes in one go."""
     if not context.user_data.get("needs_customs", True):
         await update.message.reply_text(
             "*No customs needed for this route!* You're good to go.\n\n"
-            "Send any documents or notes for the team anyway, or just tap *Done*.",
+            "Send anything for the team anyway, or just tap *Done*.",
             parse_mode="Markdown",
             reply_markup=build_keyboard(["Done"], cols=1),
-        )
-    elif cmr_required(country):
-        await update.message.reply_text(
-            "*Send a photo of the CMR now* - plus any supplier documents.\n\n"
-            "You can also type a note for the customs team. Tap *Done* when finished.",
-            parse_mode="Markdown",
-            reply_markup=build_keyboard(["Done", "I don't have the CMR"], cols=1),
         )
     else:
         await update.message.reply_text(
-            "Send any *MRN documents or photos* from the collection point.\n\n"
-            "You can also type a note for the team. Tap *Done* when finished.",
+            "*Send your paperwork now* - CMR, MRN, or any documents from loading. "
+            "Photos are fine.\n\n"
+            "You can also type a note for the customs team. Tap *Done* when finished.",
             parse_mode="Markdown",
-            reply_markup=build_keyboard(["Done"], cols=1),
+            reply_markup=build_keyboard(["Done", "I have no documents"], cols=1),
         )
     return DOCS
 
@@ -1317,7 +1343,7 @@ async def get_docs(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if low in ("done", "skip"):
         return await show_summary(update, context)
 
-    if low == "i don't have the cmr":
+    if low in ("i have no documents", "i don't have the cmr"):
         d["cmr_missing"] = True
         await msg.reply_text(
             "Noted - the team will follow up on the CMR.\n\n"
@@ -1425,6 +1451,87 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return ConversationHandler.END
 
 
+def find_manifest_for_trailer(trailer_code, trailer_id):
+    """Find today's manifest for a trailer. Tries likely field names first, then falls
+    back to matching the trailer code anywhere in the manifest JSON - schema-agnostic."""
+    import json as _json
+    code_n = _norm(trailer_code)
+    pattern = re.compile(rf"\b{re.escape(trailer_code.upper())}\b")
+    for m in API.manifests_for():
+        t = _find_key(m, "trailer", "trailercode", "trailerid")
+        if isinstance(t, dict):
+            if _norm(_find_key(t, "code", "registration") or "") == code_n:
+                return m
+            if trailer_id is not None and _find_key(t, "id") == trailer_id:
+                return m
+        elif t is not None and _norm(str(t)) == code_n:
+            return m
+        try:
+            if pattern.search(_json.dumps(m).upper()):
+                return m
+        except (TypeError, ValueError):
+            continue
+    return None
+
+
+def manifest_summary(manifest):
+    """Extract a job-style summary from a manifest, fetching its stops if needed.
+    Manifest stop shapes are unknown, so each stop is normalized defensively."""
+    stops = _find_key(manifest, "stops", "manifeststops")
+    if not stops:
+        mid = _find_key(manifest, "id", "manifestid")
+        if mid is not None:
+            stops = API.manifest_stops(mid)
+    normalized = []
+    for s in stops or []:
+        if not isinstance(s, dict):
+            continue
+        inner = _find_key(s, "stop", "jobstop")
+        normalized.append(inner if isinstance(inner, dict) else s)
+    if not normalized:
+        return {}
+    return extract_job_summary({"stops": normalized})
+
+
+def _log_manifest_schema():
+    """Diagnostic: what do manifests actually contain?"""
+    try:
+        for back in range(0, 3):  # today, yesterday, day before (weekends)
+            day = date.today() - timedelta(days=back)
+            manifests = API.manifests_for(day)
+            if manifests:
+                break
+        else:
+            print("[schema] no manifests returned for the last 3 days")
+            return
+        m0 = manifests[0]
+        print(f"[schema] {len(manifests)} manifests on {day}; manifest keys: {sorted(m0.keys())}")
+        found = {}
+        def scan(obj, path=""):
+            if isinstance(obj, dict):
+                for k, v in obj.items():
+                    kl = str(k).lower()
+                    if kl not in ("region",) and any(
+                            t in kl for t in ("trail", "reg", "vehicle", "resource", "unit", "driver", "asset")):
+                        found.setdefault(f"{path}.{k}", repr(v)[:100])
+                    scan(v, f"{path}.{k}")
+            elif isinstance(obj, list):
+                for v in obj[:3]:
+                    scan(v, path + "[]")
+        scan(m0)
+        for k, v in list(found.items())[:15]:
+            print(f"[schema]   manifest {k} = {v}")
+        if not found:
+            print("[schema] manifest has no trailer/vehicle-ish fields at top level")
+        mid = _find_key(m0, "id", "manifestid")
+        if mid is not None:
+            ms = API.manifest_stops(mid)
+            if ms and isinstance(ms[0], dict):
+                print(f"[schema] manifest/{mid}/manifeststops[0] keys: {sorted(ms[0].keys())}")
+    except Exception as e:
+        print(f"[schema] manifest inspection failed: {e}")
+
+
 def _log_job_schema(history):
     """One-time diagnostic: print the real Move IT job schema so trailer->job
     matching can be wired to actual field names instead of guesses."""
@@ -1439,7 +1546,8 @@ def _log_job_schema(history):
             if isinstance(obj, dict):
                 for k, v in obj.items():
                     kl = str(k).lower()
-                    if any(t in kl for t in ("trail", "reg", "vehicle", "resource", "unit", "driver", "asset")):
+                    if kl not in ("region",) and any(
+                            t in kl for t in ("trail", "reg", "vehicle", "resource", "unit", "driver", "asset")):
                         interesting.setdefault(f"{path}.{k}", repr(v)[:80])
                     scan(v, f"{path}.{k}")
             elif isinstance(obj, list):
@@ -1477,6 +1585,37 @@ def _log_job_schema(history):
                     extra = set(d0.keys()) - job_keys
                     print(f"[schema] job/{jid} detail keys: {sorted(d0.keys())}")
                     print(f"[schema] detail-only keys (not in list payload): {sorted(extra) or 'none'}")
+
+        # Probe: the group is the planning unit - does GET group/{id} exist,
+        # and does it carry the trailer/vehicle assignment?
+        for job in history:
+            gid = _find_key((_find_key(job, "stops") or [{}])[0], "groupid")
+            if gid is not None:
+                g = API._get(f"group/{gid}")
+                if isinstance(g, (dict, list)):
+                    g0 = g[0] if isinstance(g, list) and g else g
+                    if isinstance(g0, dict):
+                        print(f"[schema] group/{gid} keys: {sorted(g0.keys())}")
+                        ginteresting = {}
+                        def gscan(obj, path=""):
+                            if isinstance(obj, dict):
+                                for k, v in obj.items():
+                                    kl = str(k).lower()
+                                    if kl not in ("region",) and any(
+                                            t in kl for t in ("trail", "reg", "vehicle", "resource", "unit", "driver", "asset")):
+                                        ginteresting.setdefault(f"{path}.{k}", repr(v)[:100])
+                                    gscan(v, f"{path}.{k}")
+                            elif isinstance(obj, list):
+                                for v in obj[:3]:
+                                    gscan(v, path + "[]")
+                        gscan(g0)
+                        for k, v in list(ginteresting.items())[:15]:
+                            print(f"[schema]   group {k} = {v}")
+                        if not ginteresting:
+                            print("[schema] group payload has no trailer/vehicle-ish fields either")
+                else:
+                    print(f"[schema] group/{gid} not retrievable (see status above)")
+                break
     except Exception as e:
         print(f"[schema] inspection failed: {e}")
 
@@ -1488,8 +1627,8 @@ def refresh_datasets():
     try:
         history = API.job_history() if API.enabled else []
         _log_job_schema(history)
+        _log_manifest_schema()
         build_frequent_collection_points(jobs=history)
-        rank_ports_by_usage(history)
         print("[datasets] background refresh complete")
     except Exception as e:
         print(f"[datasets] background refresh failed: {e} - fallback lists remain active")
