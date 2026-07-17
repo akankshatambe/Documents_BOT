@@ -416,7 +416,7 @@ def port_keyboard_names():
     API-loaded entries stay in PORTS so typed names still match and get coordinates."""
     return list(FALLBACK_PORTS.keys())
 
-TRAILER, JOB_CONFIRM, COLLECTION, COUNTRY, PORT, PBN, DOCS, CONFIRM, RELAY = range(9)
+TRAILER, INTENT, JOB_CONFIRM, COLLECTION, COUNTRY, PORT, PBN, DOCS, CONFIRM, RELAY = range(10)
 
 
 def build_keyboard(items, cols=2, extra_row=None):
@@ -773,7 +773,8 @@ def post_pbn_alert(data, status):
         {"title": "Trailer", "value": data.get("trailer", "-")},
         {"title": "PBN", "value": data.get("pbn") or "NOT PROVIDED"},
         {"title": "Port", "value": data.get("port", "-")},
-        {"title": "Collection", "value": f"{data.get('collection', '-')} ({data.get('country', '-')})"},
+        {"title": "Loaded in", "value": (f"{data.get('collection')} ({data.get('country', '-')})"
+                                          if data.get("collection") else data.get("country") or "-")},
     ]
     if data.get("live_text"):
         facts.append({"title": "Trailer last seen", "value": data["live_text"]})
@@ -806,13 +807,15 @@ def post_to_teams(data):
     elif pbn_status in ("red", "orange", "missing"):
         header, color = f"Driver submission - customs required, PBN {pbn_status.upper()}", "Attention"
     elif missing_cmr:
-        header, color = "Driver submission - customs required, CMR MISSING", "Warning"
+        header, color = "Driver submission - customs required, PAPERWORK MISSING", "Warning"
     else:
         header, color = "Driver submission - customs required", "Attention"
 
+    loaded_val = (f"{data.get('collection')} ({data.get('country', '-')})"
+                  if data.get("collection") else data.get("country", "-"))
     facts = [
         {"title": "Trailer", "value": data.get("trailer", "-")},
-        {"title": "Collection", "value": f"{data.get('collection', '-')} ({data.get('country', '-')})"},
+        {"title": "Loaded in", "value": loaded_val},
         {"title": "Port", "value": data.get("port", "-")},
         {"title": "Distance / ETA", "value": data.get("dist_str", "-")},
         {"title": "Time to prep docs", "value": data.get("prep_str", "-")},
@@ -874,8 +877,19 @@ def post_to_teams(data):
 
 def post_submission_kb(pbn_route):
     """Persistent keyboard left after submission - the driver's home screen."""
-    items = (["Check PBN channel"] if pbn_route else []) + ["Message the team", "New submission"]
+    items = (["Check clearance (PBN)"] if pbn_route else ["Check clearance (PBN)"]) + ["Message the team", "New request"]
     return build_keyboard(items, cols=1)
+
+
+def _snapshot(d):
+    """Context for PBN alerts / team messages. Prefer the trailer the driver just
+    entered this session; fall back to the last submission's snapshot."""
+    if d.get("trailer"):
+        return {"trailer": d.get("trailer"), "port": d.get("port"),
+                "collection": d.get("collection"), "country": d.get("country"),
+                "live_text": d.get("live_text"), "pbn_route": d.get("pbn_route", True),
+                "chat_id": d.get("chat_id")}
+    return dict(d.get("last") or {})
 
 
 def post_driver_message(last, text, user):
@@ -908,7 +922,7 @@ def post_driver_message(last, text, user):
 
 async def relay_to_team(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = (update.message.text or "").strip()
-    last = context.user_data.get("last") or {}
+    last = _snapshot(context.user_data)
     kb = post_submission_kb(last.get("pbn_route", False))
     if text.lower() == "cancel":
         await update.message.reply_text("OK.", reply_markup=kb)
@@ -1160,7 +1174,9 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.user_data["last"] = last
     text = (update.message.text or "").strip().lower() if update.message else ""
 
-    if "check pbn" in text:
+    # Shortcuts from the persistent post-submission keyboard reuse the last trailer,
+    # so the driver doesn't retype it.
+    if "pbn" in text or "clearance" in text:
         context.user_data["pbn_standalone"] = True
         await update.message.reply_text(
             "Type your *PBN ID* (e.g. YL22UY97) - it's on your booking:",
@@ -1187,8 +1203,14 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def get_trailer(update: Update, context: ContextTypes.DEFAULT_TYPE):
     trailer_code = update.message.text.strip().upper()
     context.user_data["trailer"] = trailer_code
+    context.user_data["chat_id"] = update.effective_chat.id
 
-    # --- Move IT lookup: trailer + live position + today's job ---
+    greeting_name = None
+    # --- Move IT lookup: capture live position + attempt a silent prefill ---
+    # The trailer->run match is best-effort only: if it succeeds it saves the driver
+    # a couple of taps on the "Loaded" path, if it fails (the common case today,
+    # because planners don't assign the vehicle/trailer on the group) nothing breaks -
+    # the driver just answers the short manual questions.
     if API.enabled:
         trailer = API.search_trailer(trailer_code)
         if trailer:
@@ -1201,35 +1223,74 @@ async def get_trailer(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 context.user_data["live_text"] = f"{text or ''} {('(' + str(when)[:16] + ')') if when else ''}".strip()
 
             trailer_id = _find_key(trailer, "id")
-
-            # Groups carry the trailer assignment - match today's run through them
             s = find_trailer_run(trailer_code, trailer_id, trailer)
             if s and s.get("collection"):
+                # Stash it - only used if the driver picks "I've loaded".
                 context.user_data["job_summary"] = s
                 context.user_data["collection"] = s["collection"]
-                lines = [f"*Found your run in Move IT:*\n"]
-                if s.get("customer"):
-                    lines.append(f"Customer: {md(s['customer'])}")
-                lines.append(f"Collection: {md(s['collection'])}")
-                if s.get("delivery"):
-                    lines.append(f"Delivery: {md(s['delivery'])}")
-                lines.append("\nIs this your load?")
-                await update.message.reply_text(
-                    "\n".join(lines),
-                    parse_mode="Markdown",
-                    reply_markup=build_keyboard(["Yes, that's my load", "No - enter details myself"], cols=1),
-                )
-                return JOB_CONFIRM
+                greeting_name = s.get("driver") or None
 
-    # --- Fallback: manual v3 flow ---
-    names = list(QUICK_POINTS.keys())
-    hint = "\n\nOr *type a few letters* to search all locations." if ADDRESS_BOOK else ""
+    return await ask_intent(update, context, trailer_code, greeting_name)
+
+
+async def ask_intent(update, context, trailer_code=None, greeting_name=None):
+    """The switchboard: one tap tells the bot why the driver opened it, so we only
+    ask what that need actually requires (fixes the 'stupid questions' feedback)."""
+    trailer_code = trailer_code or context.user_data.get("trailer", "")
+    who = f" {md(greeting_name)}" if greeting_name else ""
     await update.message.reply_text(
-        f"Trailer *{md(trailer_code)}* noted.\n\nWhere did you *collect the load*? Tap one:{hint}",
+        f"Thanks{who} - trailer *{md(trailer_code)}* noted.\n\n*What do you need?*",
         parse_mode="Markdown",
-        reply_markup=build_keyboard(names, cols=2, extra_row=["Other location"]),
+        reply_markup=build_keyboard(
+            ["I've loaded - send paperwork",
+             "Check clearance (PBN)",
+             "Message the team"],
+            cols=1,
+        ),
     )
-    return COLLECTION
+    return INTENT
+
+
+async def get_intent(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Route the driver to the short path for whatever they picked."""
+    choice = (update.message.text or "").strip().lower()
+
+    if "pbn" in choice or "clearance" in choice:
+        await update.message.reply_text(
+            "Type your *PBN ID* (e.g. YL22UY97) - it's on your booking:",
+            parse_mode="Markdown",
+            reply_markup=build_keyboard(["I don't have a PBN", "Cancel"], cols=1),
+        )
+        return PBN
+
+    if "message" in choice:
+        await update.message.reply_text(
+            "Type your message for the customs team - a photo is fine too. "
+            "For example a problem at the port, a question about your route, "
+            "or an update like 'transit open at Calais'.",
+            reply_markup=build_keyboard(["Cancel"], cols=1),
+        )
+        return RELAY
+
+    # Default: "I've loaded". If the silent prefill found the run, offer a one-tap
+    # confirm; otherwise go straight to the short manual questions (country -> port).
+    s = context.user_data.get("job_summary")
+    if s and s.get("collection"):
+        lines = ["*I think this is your load:*\n"]
+        if s.get("customer"):
+            lines.append(f"Customer: {md(s['customer'])}")
+        lines.append(f"Collection: {md(s['collection'])}")
+        if s.get("delivery"):
+            lines.append(f"Delivery: {md(s['delivery'])}")
+        lines.append("\nIs that right?")
+        await update.message.reply_text(
+            "\n".join(lines),
+            parse_mode="Markdown",
+            reply_markup=build_keyboard(["Yes, that's my load", "No - enter it myself"], cols=1),
+        )
+        return JOB_CONFIRM
+
+    return await ask_country(update, context)
 
 
 async def job_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1246,14 +1307,10 @@ async def job_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
             context.user_data["country"] = mapped
             return await ask_port(update, context)
         return await ask_country(update, context)
-    # Driver says the job is wrong - manual flow
-    names = list(QUICK_POINTS.keys())
-    await update.message.reply_text(
-        "No problem. Where did you *collect the load*? Tap one:",
-        parse_mode="Markdown",
-        reply_markup=build_keyboard(names, cols=2, extra_row=["Other location"]),
-    )
-    return COLLECTION
+    # Driver says the prefill is wrong - clear it and ask the short manual questions.
+    context.user_data.pop("job_summary", None)
+    context.user_data.pop("collection", None)
+    return await ask_country(update, context)
 
 
 async def get_collection(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1369,7 +1426,7 @@ async def ask_docs(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
     else:
         await update.message.reply_text(
-            "*Send your paperwork now* - CMR, MRN, or any documents from loading. "
+            "*Send your paperwork now* - a photo of any documents you got at loading. "
             "Photos are fine.\n\n"
             "You can also type a note for the customs team. Tap *Done* when finished.",
             parse_mode="Markdown",
@@ -1385,7 +1442,7 @@ async def get_pbn(update: Update, context: ContextTypes.DEFAULT_TYPE):
     button - typically used by the driver at port check-in."""
     text = (update.message.text or "").strip()
     d = context.user_data
-    last = d.get("last") or {}
+    last = _snapshot(d)
     kb = post_submission_kb(last.get("pbn_route", True))
 
     def alert_data(extra=None):
@@ -1494,10 +1551,10 @@ async def get_docs(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if low in ("done", "skip"):
         return await show_summary(update, context)
 
-    if low in ("i have no documents", "i don't have the cmr"):
-        d["cmr_missing"] = True
+    if low in ("i have no documents", "i don't have the cmr", "no documents"):
+        d["cmr_missing"] = True   # internal flag: paperwork missing
         await msg.reply_text(
-            "Noted - the team will follow up on the CMR.\n\n"
+            "Noted - the team will follow up on the paperwork.\n\n"
             "Anything else? Send it, type a note, or tap *Done*.",
             parse_mode="Markdown", reply_markup=build_keyboard(["Done"], cols=1))
         return DOCS
@@ -1528,9 +1585,9 @@ async def show_summary(update: Update, context: ContextTypes.DEFAULT_TYPE):
     d = context.user_data
     names = d.get("doc_names") or []
     if names:
-        d["docs"] = ", ".join(names) + (" | CMR NOT PROVIDED" if d.get("cmr_missing") else "")
+        d["docs"] = ", ".join(names) + (" | PAPERWORK NOT PROVIDED" if d.get("cmr_missing") else "")
     else:
-        d["docs"] = "CMR NOT PROVIDED" if d.get("cmr_missing") else "None"
+        d["docs"] = "PAPERWORK NOT PROVIDED" if d.get("cmr_missing") else "None"
     d["doc_url"] = (d.get("doc_urls") or [None])[0]
     d.setdefault("notes", "None")
 
@@ -1539,16 +1596,21 @@ async def show_summary(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not d.get("needs_customs", True):
         status_line = "\nNo customs needed - good to go\n"
     elif d.get("cmr_missing"):
-        status_line = "\nCMR missing - the team will follow up\n"
+        status_line = "\nPaperwork missing - the team will follow up\n"
     else:
         status_line = ""
     job = d.get("job_summary") or {}
     job_line = f"Job: {md(job['job_id'])}\n" if job.get("job_id") else ""
+    # If we only know the country (normal manual path), show just the country.
+    if d.get("collection"):
+        loaded_line = f"Loaded in: {md(d.get('collection'))} ({md(d.get('country'))})\n"
+    else:
+        loaded_line = f"Loaded in: {md(d.get('country'))}\n"
     summary = (
         f"*Please check your summary:*\n{status_line}\n"
         f"{job_line}"
         f"Trailer: *{md(d.get('trailer'))}*\n"
-        f"Collection: {md(d.get('collection'))} ({md(d.get('country'))})\n"
+        f"{loaded_line}"
         f"Port: {md(d.get('port'))}\n"
         f"Distance: {md(d.get('dist_str'))}\n"
         f"Docs: {md(d.get('docs'))}\n"
@@ -1634,8 +1696,8 @@ def main():
         entry_points=[CommandHandler("start", start), MessageHandler(filters.TEXT & ~filters.COMMAND, start)],
         states={
             TRAILER:     [MessageHandler(filters.TEXT & ~filters.COMMAND, get_trailer)],
+            INTENT:      [MessageHandler(filters.TEXT & ~filters.COMMAND, get_intent)],
             JOB_CONFIRM: [MessageHandler(filters.TEXT & ~filters.COMMAND, job_confirm)],
-            COLLECTION:  [MessageHandler(filters.TEXT & ~filters.COMMAND, get_collection)],
             COUNTRY:     [MessageHandler(filters.TEXT & ~filters.COMMAND, get_country)],
             PORT:        [MessageHandler(filters.TEXT & ~filters.COMMAND, get_port)],
             PBN:         [MessageHandler(filters.TEXT & ~filters.COMMAND, get_pbn)],
@@ -1646,7 +1708,7 @@ def main():
         fallbacks=[CommandHandler("cancel", cancel)],
     )
     app.add_handler(conv)
-    print("=== Bot v7.2 FINAL is running ===")
+    print("=== Bot v8 (intent-first) is running ===")
     app.run_polling()
 
 
