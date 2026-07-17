@@ -342,6 +342,13 @@ IRISH_SEA_PORTS = set(_IRISH_SEA_KEYWORDS)
 COUNTRY_OPTIONS = ["UK", "Northern Ireland", "Ireland", "France", "Germany",
                    "Netherlands", "Belgium", "Spain", "Italy", "Poland", "Other"]
 
+# Compact country pills for the "Loaded" step (short labels -> full names for customs logic).
+LOADED_COUNTRY_BUTTONS = ["IE", "GB", "FR", "BE", "NL", "Other"]
+COUNTRY_CODE_MAP = {
+    "ie": "Ireland", "gb": "UK", "uk": "UK", "fr": "France",
+    "be": "Belgium", "nl": "Netherlands", "ni": "Northern Ireland",
+}
+
 
 def _resolve_named_ports(keywords):
     """Map known keyword ports (e.g. 'Belfast') to whatever name the live API actually returned,
@@ -1193,7 +1200,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return RELAY
 
     await update.message.reply_text(
-        "Hi! I'm the O'Toole Transport customs bot.\n\nWhat is your *trailer number*?",
+        "Hi \U0001F44B What's your *trailer number*?",
         parse_mode="Markdown",
         reply_markup=ReplyKeyboardRemove(),
     )
@@ -1237,9 +1244,9 @@ async def ask_intent(update, context, trailer_code=None, greeting_name=None):
     """The switchboard: one tap tells the bot why the driver opened it, so we only
     ask what that need actually requires (fixes the 'stupid questions' feedback)."""
     trailer_code = trailer_code or context.user_data.get("trailer", "")
-    who = f" {md(greeting_name)}" if greeting_name else ""
+    who = f", {md(greeting_name)}" if greeting_name else ""
     await update.message.reply_text(
-        f"Thanks{who} - trailer *{md(trailer_code)}* noted.\n\n*What do you need?*",
+        f"Got it{who}.\n\n*What do you need?*",
         parse_mode="Markdown",
         reply_markup=build_keyboard(
             ["I've loaded - send paperwork",
@@ -1375,14 +1382,15 @@ async def ask_country(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "Which *country* did you load in?",
         parse_mode="Markdown",
-        reply_markup=build_keyboard(COUNTRY_OPTIONS, cols=3),
+        reply_markup=build_keyboard(LOADED_COUNTRY_BUTTONS, cols=3),
     )
     return COUNTRY
 
 
 async def get_country(update: Update, context: ContextTypes.DEFAULT_TYPE):
     typed = update.message.text.strip()
-    context.user_data["country"] = match_country(typed) or typed
+    context.user_data["country"] = (COUNTRY_CODE_MAP.get(typed.lower())
+                                     or match_country(typed) or typed)
     if context.user_data.get("col_lat") is None and context.user_data.get("live_lat") is None:
         lat, lon = geocode(context.user_data.get("collection", ""), context.user_data["country"])
         context.user_data["col_lat"] = lat
@@ -1640,7 +1648,7 @@ async def confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
         else:
             msg = "*Customs team notified!*\n\nThey'll prepare your paperwork and message you here if anything is needed.\n\nSafe drive!"
         if pbn_route:
-            msg += ("\n\n🚢 *At port check-in*, tap *Check PBN channel* below "
+            msg += ("\n\n🚢 *At port check-in*, tap *Check clearance (PBN)* below "
                     "and I'll tell you your boarding channel.")
         await update.message.reply_text(msg, parse_mode="Markdown", reply_markup=kb)
     else:
@@ -1686,6 +1694,20 @@ def refresh_datasets():
 
 
 def main():
+    # Fail clearly if the deploy is missing its environment variables, instead of
+    # dumping a Telegram InvalidToken stack trace.
+    if not BOT_TOKEN:
+        print("=" * 60)
+        print("CONFIG ERROR: BOT_TOKEN is not set.")
+        print("Set it in Railway -> your service -> Variables tab.")
+        print("Also expected: TEAMS_WEBHOOK, and (for Move IT live)")
+        print("MOVEIT_BASE_URL / MOVEIT_API_KEY / MOVEIT_API_PASSWORD.")
+        print("=" * 60)
+        raise SystemExit(1)
+    if not TEAMS_WEBHOOK:
+        print("WARNING: TEAMS_WEBHOOK is not set - submissions and alerts "
+              "will not reach the customs team.")
+
     load_address_book()
     load_ports_from_api()  # fast: single call, worth doing before polling starts
     threading.Thread(target=refresh_datasets, daemon=True).start()
