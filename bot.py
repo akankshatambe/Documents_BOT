@@ -14,6 +14,7 @@ from telegram.ext import (
     ContextTypes,
     filters,
 )
+from faq import match_faq
 
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
 TEAMS_WEBHOOK = os.environ.get("TEAMS_WEBHOOK")
@@ -423,7 +424,7 @@ def port_keyboard_names():
     API-loaded entries stay in PORTS so typed names still match and get coordinates."""
     return list(FALLBACK_PORTS.keys())
 
-TRAILER, INTENT, JOB_CONFIRM, COLLECTION, COUNTRY, PORT, PBN, DOCS, CONFIRM, RELAY = range(10)
+TRAILER, INTENT, JOB_CONFIRM, COLLECTION, COUNTRY, PORT, PBN, DOCS, CONFIRM, RELAY, RELAY_CONFIRM = range(11)
 
 
 def build_keyboard(items, cols=2, extra_row=None):
@@ -934,12 +935,44 @@ async def relay_to_team(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if text.lower() == "cancel":
         await update.message.reply_text("OK.", reply_markup=kb)
         return ConversationHandler.END
+
+    # Try an instant answer before pinging the customs team - most driver
+    # questions are the same handful of things, and this cuts their wait to zero.
+    faq_answer = match_faq(text)
+    if faq_answer:
+        context.user_data["pending_relay_text"] = text
+        await update.message.reply_text(
+            f"{faq_answer}\n\n_Didn't answer it? Tap below and I'll send it to the team._",
+            parse_mode="Markdown",
+            reply_markup=build_keyboard(["Still send to the team", "That's sorted, thanks"], cols=1),
+        )
+        return RELAY_CONFIRM
+
     ok = post_driver_message(last, text, update.effective_user)
     await update.message.reply_text(
         "✅ Sent to the customs team - they'll get back to you here." if ok
         else "Couldn't send that - please call the customs team directly.",
         reply_markup=kb,
     )
+    return ConversationHandler.END
+
+
+async def relay_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """After an instant FAQ answer: send the original message on if it didn't help."""
+    choice = (update.message.text or "").strip().lower()
+    last = _snapshot(context.user_data)
+    kb = post_submission_kb(last.get("pbn_route", False))
+    text = context.user_data.pop("pending_relay_text", "")
+
+    if "still send" in choice:
+        ok = post_driver_message(last, text, update.effective_user)
+        await update.message.reply_text(
+            "✅ Sent to the customs team - they'll get back to you here." if ok
+            else "Couldn't send that - please call the customs team directly.",
+            reply_markup=kb,
+        )
+    else:
+        await update.message.reply_text("Glad that helped! 👍", reply_markup=kb)
     return ConversationHandler.END
 
 
@@ -1180,6 +1213,21 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if last:
         context.user_data["last"] = last
     text = (update.message.text or "").strip().lower() if update.message else ""
+
+    # Answer common questions instantly, without waiting on the customs team -
+    # e.g. "what does orange PBN mean", "do I need a GMR". Checked before the
+    # button shortcuts below so a real question never gets mistaken for one.
+    faq_answer = match_faq(text)
+    if faq_answer:
+        await update.message.reply_text(
+            faq_answer,
+            parse_mode="Markdown",
+            reply_markup=build_keyboard(
+                ["I've loaded - send paperwork", "Check clearance (PBN)", "Message the team"],
+                cols=1,
+            ),
+        )
+        return ConversationHandler.END
 
     # Shortcuts from the persistent post-submission keyboard reuse the last trailer,
     # so the driver doesn't retype it.
@@ -1726,6 +1774,7 @@ def main():
             DOCS:        [MessageHandler(filters.TEXT | filters.PHOTO | filters.Document.ALL, get_docs)],
             CONFIRM:     [MessageHandler(filters.TEXT & ~filters.COMMAND, confirm)],
             RELAY:       [MessageHandler(filters.TEXT & ~filters.COMMAND, relay_to_team)],
+            RELAY_CONFIRM: [MessageHandler(filters.TEXT & ~filters.COMMAND, relay_confirm)],
         },
         fallbacks=[CommandHandler("cancel", cancel)],
     )
